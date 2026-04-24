@@ -1,28 +1,16 @@
 /*
- * ClockSpinner — MKS DLC32 constant-speed stepper firmware
+ * ClockSpinner — MKS DLC32 stepper firmware with WLED-compatible network API
  *
- * Wi-Fi: Connect to "ClockSpinner" (password: clockwork)
- * Web UI: http://192.168.4.1
- * Serial monitor: 115200 baud
+ * Direct access (AP):  Connect to "ClockSpinner" / "clockwork" → http://192.168.4.1
+ * Network access (STA): Connect to your WiFi via the setup page, then the device
+ *                        advertises itself via mDNS (_wled._tcp) and is discovered
+ *                        automatically by the Nebula app.
+ * Serial: 115200 baud
  *
- * HARDWARE NOTE: STEP/DIR/ENABLE signals are NOT on direct GPIO pins.
- * They go through a 74HC595 shift register chain controlled by 3 GPIOs:
- *   GPIO 16 = SR_BCK  (bit clock)
- *   GPIO 17 = SR_WS   (latch)
- *   GPIO 21 = SR_DATA (data)
- * Bit assignments in the 32-bit shift word:
- *   Bit 0 = ENABLE (all axes, active LOW)
- *   Bit 1 = X STEP
- *   Bit 2 = X DIR
- *   Bit 5 = Y STEP
- *   Bit 6 = Y DIR
- *
- * If motors don't move:
- *   1. Check serial output — confirm "Web server started" message
- *   2. Verify you can reach http://192.168.4.1
- *   3. Try clicking Start in the web UI and watch Serial for any errors
- *   4. Check that 24V (or 12V) power is connected to the motor power input
- *   5. If motors buzz but don't move, try reversing direction in the UI
+ * HARDWARE: STEP/DIR/ENABLE route through 74HC595 shift registers.
+ *   GPIO 16 = SR_BCK, GPIO 17 = SR_WS, GPIO 21 = SR_DATA
+ *   Bit 0=ENABLE(active LOW)  Bit 1=X_STEP  Bit 2=X_DIR
+ *   Bit 5=Y_STEP  Bit 6=Y_DIR
  */
 
 // =============================================================================
@@ -31,8 +19,10 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <ESPmDNS.h>
+#include <SPIFFS.h>
 #include <WebServer.h>
-#include <Preferences.h>
+#include <ArduinoJson.h>
 
 // Shift register pins
 #define SR_BCK   16
@@ -46,50 +36,44 @@
 #define BIT_Y_STEP  5
 #define BIT_Y_DIR   6
 
-// Motor hardware limits (motor RPM, never exposed to user)
-#define STEPS_PER_REV   3200      // 200 full steps × 16x microstepping
-#define MIN_MOTOR_RPM   0.5f
-#define MAX_MOTOR_RPM   120.0f
+// Motor config
+#define STEPS_PER_REV  3200
+#define MIN_RPM        0.5f
+#define MAX_RPM        120.0f
+#define DEFAULT_RPM    30.0f
 
-// User-facing defaults (output RPM)
-#define DEFAULT_GEAR_RATIO    1.0f    // 1 motor turn = 1 output turn
-#define DEFAULT_MAX_OUT_RPM   120.0f  // max output RPM allowed by slider
-#define DEFAULT_TARGET_RPM    30.0f   // default target output RPM on first boot
-#define DEFAULT_ACCEL         5.0f    // output RPM per second
-// Start Speed: motor launches at this output RPM before ramping to target.
-// Default = target RPM (instant start, same as before acceleration was added).
-// Lower it only if the wheel can tolerate a slow start without stalling.
-#define DEFAULT_START_RPM     DEFAULT_TARGET_RPM
-
-// Wi-Fi
-#define WIFI_SSID  "ClockSpinner"
-#define WIFI_PASS  "clockwork"
+// AP fallback (always available for direct access)
+#define AP_SSID  "ClockSpinner"
+#define AP_PASS  "clockwork"
 
 // =============================================================================
 // SECTION 2: GLOBALS
 // =============================================================================
 
+// Shift register
 static volatile uint32_t srState = 0;
 static portMUX_TYPE      srMux   = portMUX_INITIALIZER_UNLOCKED;
 
-// Internal motor speed (ramps toward targetMotorRpm, used by timer ISR)
-volatile float currentMotorRpm = MIN_MOTOR_RPM;
-volatile float targetMotorRpm  = DEFAULT_TARGET_RPM;
-
+// Motor state
+volatile float currentRpm   = DEFAULT_RPM;
 volatile bool  motorRunning = false;
 volatile bool  dirForward   = true;
+hw_timer_t*    stepTimer    = nullptr;
 
-// User-facing settings (all in output RPM / output RPM per second)
-float targetOutputRpm  = DEFAULT_TARGET_RPM;  // what user set
-float startOutputRpm   = DEFAULT_START_RPM;   // output RPM the motor launches at (before ramp)
-float accelRpmPerSec   = DEFAULT_ACCEL;        // output RPM/sec
-float gearRatio        = DEFAULT_GEAR_RATIO;   // output_rpm = motor_rpm * gearRatio
-float configMaxOutRpm  = DEFAULT_MAX_OUT_RPM;  // slider upper limit
-bool  bootAutoStart    = true;
+// WLED state — `on` maps to motor start/stop; `bri` stored but not yet mapped
+bool    wledOn  = false;
+uint8_t wledBri = 128;
 
-hw_timer_t* stepTimer = nullptr;
-WebServer   server(80);
-Preferences prefs;
+// Config (persisted in /cfg.json on LittleFS)
+String deviceName = "MotorController";
+String wifiSSID   = "";
+String wifiPass   = "";
+
+// Runtime flags
+bool isSTAMode = false;
+
+// Web server (built-in synchronous WebServer — motor runs in ISR so blocking is fine)
+WebServer server(80);
 
 // =============================================================================
 // SECTION 3: SHIFT REGISTER FUNCTIONS
@@ -118,76 +102,23 @@ void srWrite(uint8_t bitIndex, bool val) {
 // SECTION 4: MOTOR HELPERS
 // =============================================================================
 
-uint32_t rpmToMicros(float motorRpm) {
-    return (uint32_t)(1e6f / ((motorRpm / 60.0f) * STEPS_PER_REV));
-}
-
-// Convert output RPM → motor RPM, clamped to hardware limits
-float outputToMotor(float outputRpm) {
-    if (gearRatio <= 0.0f) return MIN_MOTOR_RPM;
-    return constrain(outputRpm / gearRatio, MIN_MOTOR_RPM, MAX_MOTOR_RPM);
-}
-
-// Convert motor RPM → output RPM
-float motorToOutput(float motorRpm) {
-    return motorRpm * gearRatio;
+uint32_t rpmToMicros(float rpm) {
+    return (uint32_t)(1e6f / ((rpm / 60.0f) * STEPS_PER_REV));
 }
 
 void applyDirection() {
     srWrite(BIT_X_DIR, dirForward);
     srWrite(BIT_Y_DIR, dirForward);
-    Serial.print("applyDirection: ");
-    Serial.println(dirForward ? "FWD" : "REV");
 }
 
 void enableMotors() {
-    srWrite(BIT_ENABLE, false);   // clear bit = output LOW = active-low ENABLE asserted
-    Serial.print("enableMotors: srState=0x");
-    Serial.println(srState, HEX);
+    srWrite(BIT_ENABLE, false);   // output LOW = active-low ENABLE asserted
+    Serial.printf("enableMotors srState=0x%X\n", srState);
 }
 
 void disableMotors() {
-    srWrite(BIT_ENABLE, true);    // set bit = output HIGH = ENABLE de-asserted
-    Serial.print("disableMotors: srState=0x");
-    Serial.println(srState, HEX);
-}
-
-// =============================================================================
-// SECTION 4.5: SETTINGS PERSISTENCE
-// =============================================================================
-
-void loadSettings() {
-    prefs.begin("clockspinner", true);
-    gearRatio       = prefs.getFloat("gearRatio",   DEFAULT_GEAR_RATIO);
-    configMaxOutRpm = prefs.getFloat("maxOutRpm",   DEFAULT_MAX_OUT_RPM);
-    targetOutputRpm = prefs.getFloat("targetOutRpm",DEFAULT_TARGET_RPM);
-    startOutputRpm  = prefs.getFloat("startOutRpm", DEFAULT_START_RPM);
-    accelRpmPerSec  = prefs.getFloat("accel",       DEFAULT_ACCEL);
-    bootAutoStart   = prefs.getBool ("autostart",   true);
-    dirForward      = prefs.getBool ("dir",         true);
-    prefs.end();
-
-    targetMotorRpm  = outputToMotor(targetOutputRpm);
-    currentMotorRpm = MIN_MOTOR_RPM;
-
-    Serial.printf("Loaded: outputTarget=%.2f startOut=%.2f motorTarget=%.2f ratio=%.4f maxOut=%.2f accel=%.2f autostart=%d dir=%d\n",
-        targetOutputRpm, startOutputRpm, (float)targetMotorRpm, gearRatio, configMaxOutRpm,
-        accelRpmPerSec, (int)bootAutoStart, (int)(bool)dirForward);
-}
-
-void saveSettings() {
-    prefs.begin("clockspinner", false);
-    prefs.putFloat("gearRatio",   gearRatio);
-    prefs.putFloat("maxOutRpm",   configMaxOutRpm);
-    prefs.putFloat("targetOutRpm",targetOutputRpm);
-    prefs.putFloat("startOutRpm", startOutputRpm);
-    prefs.putFloat("accel",       accelRpmPerSec);
-    prefs.putBool ("autostart",   bootAutoStart);
-    prefs.putBool ("dir",         dirForward);
-    prefs.end();
-
-    Serial.printf("Saved:  outputTarget=%.2f startOut=%.2f ratio=%.4f maxOut=%.2f accel=%.2f autostart=%d\n",
-        targetOutputRpm, startOutputRpm, gearRatio, configMaxOutRpm, accelRpmPerSec, (int)bootAutoStart);
+    srWrite(BIT_ENABLE, true);    // output HIGH = ENABLE de-asserted
+    Serial.printf("disableMotors srState=0x%X\n", srState);
 }
 
 // =============================================================================
@@ -195,39 +126,30 @@ void saveSettings() {
 // =============================================================================
 
 void IRAM_ATTR onStep() {
-    // DO NOT call srWrite() here — use portENTER_CRITICAL_ISR + direct bit ops
     portENTER_CRITICAL_ISR(&srMux);
-    srState |=  (1UL << BIT_X_STEP) | (1UL << BIT_Y_STEP);   // both HIGH
+    srState |=  (1UL << BIT_X_STEP) | (1UL << BIT_Y_STEP);
     shiftOut32();
     delayMicroseconds(10);
-    srState &= ~((1UL << BIT_X_STEP) | (1UL << BIT_Y_STEP));  // both LOW
+    srState &= ~((1UL << BIT_X_STEP) | (1UL << BIT_Y_STEP));
     shiftOut32();
     portEXIT_CRITICAL_ISR(&srMux);
 }
-// shiftOut32() called exactly twice per step — ~20 µs ISR time.
 
 // =============================================================================
-// SECTION 6: START / STOP / SET SPEED / RAMP
+// SECTION 6: MOTOR CONTROL
 // =============================================================================
 
 void startMotor() {
     if (motorRunning) return;
-    // Launch at startOutputRpm (converted to motor RPM), clamped to [MIN, target].
-    // Default = target RPM → instant full-speed start (matches pre-acceleration behavior,
-    // ensures enough torque to overcome static friction on heavy loads like water wheels).
-    float launchMotorRpm = constrain(outputToMotor(startOutputRpm),
-                                     MIN_MOTOR_RPM, (float)targetMotorRpm);
-    currentMotorRpm = launchMotorRpm;
-    Serial.printf("startMotor: launch=%.2f target=%.2f accel=%.2f\n",
-        launchMotorRpm, (float)targetMotorRpm, accelRpmPerSec);
+    Serial.printf("startMotor: %.1f RPM\n", (float)currentRpm);
     applyDirection();
     enableMotors();
     stepTimer = timerBegin(0, 80, true);
     timerAttachInterrupt(stepTimer, &onStep, true);
-    timerAlarmWrite(stepTimer, rpmToMicros(currentMotorRpm), true);
+    timerAlarmWrite(stepTimer, rpmToMicros(currentRpm), true);
     timerAlarmEnable(stepTimer);
     motorRunning = true;
-    Serial.println("startMotor: running");
+    wledOn = true;
 }
 
 void stopMotor() {
@@ -238,51 +160,153 @@ void stopMotor() {
     stepTimer = nullptr;
     disableMotors();
     motorRunning = false;
+    wledOn = false;
 }
 
-// setSpeed takes OUTPUT RPM (user-facing). Converts to motor RPM internally.
-void setSpeed(float outputRpm) {
-    outputRpm = constrain(outputRpm, 0.0f, configMaxOutRpm);
-    targetOutputRpm = outputRpm;
-    targetMotorRpm  = outputToMotor(outputRpm);
-    if (!motorRunning) {
-        currentMotorRpm = MIN_MOTOR_RPM;
+void setSpeed(float rpm) {
+    rpm = constrain(rpm, MIN_RPM, MAX_RPM);
+    currentRpm = rpm;
+    if (motorRunning && stepTimer != nullptr) {
+        timerAlarmWrite(stepTimer, rpmToMicros(rpm), true);
     }
-    saveSettings();
-}
-
-// Called every loop() — ramps currentMotorRpm toward targetMotorRpm.
-// accelRpmPerSec is in output RPM/sec; we divide by gearRatio for motor RPM/sec.
-void updateRamp() {
-    if (!motorRunning || stepTimer == nullptr) return;
-    if (currentMotorRpm == targetMotorRpm) return;
-
-    static uint32_t lastRampMs = 0;
-    uint32_t now = millis();
-    float dt = (now - lastRampMs) / 1000.0f;
-    lastRampMs = now;
-
-    if (dt <= 0.0f || dt > 0.5f) {
-        lastRampMs = now;
-        return;
-    }
-
-    // Convert output accel → motor accel
-    float motorAccel = (gearRatio > 0.0f) ? (accelRpmPerSec / gearRatio) : accelRpmPerSec;
-    float maxStep    = motorAccel * dt;
-    float diff       = targetMotorRpm - currentMotorRpm;
-
-    if (fabsf(diff) <= maxStep) {
-        currentMotorRpm = targetMotorRpm;
-    } else {
-        currentMotorRpm += (diff > 0.0f) ? maxStep : -maxStep;
-    }
-    currentMotorRpm = constrain(currentMotorRpm, MIN_MOTOR_RPM, MAX_MOTOR_RPM);
-    timerAlarmWrite(stepTimer, rpmToMicros(currentMotorRpm), true);
 }
 
 // =============================================================================
-// SECTION 7: HTML PAGE
+// SECTION 7: CONFIG PERSISTENCE (LittleFS /cfg.json)
+// =============================================================================
+
+void loadConfig() {
+    if (!SPIFFS.exists("/cfg.json")) {
+        Serial.println("No /cfg.json — using defaults");
+        return;
+    }
+    File f = SPIFFS.open("/cfg.json", "r");
+    if (!f) { Serial.println("cfg.json open failed"); return; }
+    DynamicJsonDocument doc(512);
+    DeserializationError err = deserializeJson(doc, f);
+    f.close();
+    if (err) { Serial.printf("cfg.json parse error: %s\n", err.c_str()); return; }
+    deviceName = doc["id"]["name"] | "MotorController";
+    if (doc["nw"]["ins"].size() > 0) {
+        wifiSSID = doc["nw"]["ins"][0]["ssid"] | "";
+        wifiPass = doc["nw"]["ins"][0]["psk"]  | "";
+    }
+    Serial.printf("Config: name=%s ssid=%s\n", deviceName.c_str(), wifiSSID.c_str());
+}
+
+void saveConfig() {
+    File f = SPIFFS.open("/cfg.json", "w");
+    if (!f) { Serial.println("cfg.json write failed"); return; }
+    DynamicJsonDocument doc(512);
+    doc["id"]["name"] = deviceName;
+    JsonObject ins0 = doc["nw"]["ins"].createNestedObject();
+    ins0["ssid"] = wifiSSID;
+    ins0["psk"]  = wifiPass;
+    serializeJson(doc, f);
+    f.close();
+    Serial.println("Config saved");
+}
+
+// =============================================================================
+// SECTION 8: WLED JSON BUILDERS
+// =============================================================================
+
+// Populates a JsonObject with the full WLED state.
+// `on` mirrors motorRunning; `bri` is stored but not yet mapped to motor speed.
+void populateState(JsonObject root) {
+    root["on"]         = motorRunning;
+    root["bri"]        = wledBri;
+    root["transition"] = 7;
+    root["ps"]         = -1;
+    root["pss"]        = 0;
+    root["pl"]         = -1;
+    root["mainseg"]    = 0;
+
+    JsonArray seg = root.createNestedArray("seg");
+    JsonObject s  = seg.createNestedObject();
+    s["id"]    = 0;   s["start"] = 0;   s["stop"]  = 1;
+    s["len"]   = 1;   s["grp"]   = 1;   s["spc"]   = 0;
+    s["of"]    = 0;   s["on"]    = motorRunning;
+    s["frz"]   = false; s["bri"] = 255; s["cct"]   = 127; s["set"] = 0;
+    JsonArray col = s.createNestedArray("col");
+    JsonArray c1 = col.createNestedArray(); c1.add(128); c1.add(0); c1.add(0);
+    JsonArray c2 = col.createNestedArray(); c2.add(0);   c2.add(0); c2.add(0);
+    JsonArray c3 = col.createNestedArray(); c3.add(0);   c3.add(0); c3.add(0);
+    s["fx"]  = 0;   s["sx"]  = 128; s["ix"]  = 128; s["pal"] = 0;
+    s["c1"]  = 128; s["c2"]  = 128; s["c3"]  = 16;
+    s["sel"] = true; s["rev"] = false; s["mi"] = false;
+    s["o1"]  = false; s["o2"] = false; s["o3"] = false;
+    s["si"]  = 0;   s["m12"] = 0;
+}
+
+// Populates a JsonObject with WLED device info. `brand:"WLED"` is required for
+// Nebula app discovery. Dynamic fields are populated from ESP32 runtime values.
+void populateInfo(JsonObject root) {
+    String mac = WiFi.macAddress();
+    mac.replace(":", ""); mac.toLowerCase();
+
+    root["ver"]          = "0.15.0-b3";
+    root["vid"]          = 2409250;
+    root["name"]         = deviceName;
+    root["brand"]        = "WLED";        // ← required for Nebula app discovery
+    root["product"]      = "FOSS";
+    root["mac"]          = mac;
+    root["ip"]           = isSTAMode ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+    root["arch"]         = "esp32";
+    root["core"]         = "v4.4.7";
+    root["clock"]        = 160;
+    root["flash"]        = 4;
+    root["freeheap"]     = (int)ESP.getFreeHeap();
+    root["uptime"]       = (int)(millis() / 1000);
+    root["opt"]          = 1;
+    root["live"]         = false;
+    root["liveseg"]      = -1;
+    root["lm"]           = "";
+    root["lip"]          = "";
+    root["ws"]           = -1;
+    root["fxcount"]      = 1;
+    root["palcount"]     = 1;
+    root["cpalcount"]    = 0;
+    root["str"]          = false;
+    root["simplifiedui"] = false;
+    root["udpport"]      = 21324;
+    root["ndc"]          = -1;
+    root.createNestedArray("maps");
+
+    JsonObject leds = root.createNestedObject("leds");
+    leds["count"]  = 1;  leds["lc"]     = 1;
+    leds.createNestedArray("seglc").add(1);
+    leds["rgbw"]   = false; leds["wv"]  = false; leds["cct"]    = 0;
+    leds["fps"]    = 40;    leds["bootps"] = 0;  leds["pwr"]    = 0;
+    leds["maxpwr"] = 0;     leds["maxseg"] = 1;
+
+    int rssi = isSTAMode ? WiFi.RSSI() : 0;
+    JsonObject wf = root.createNestedObject("wifi");
+    wf["bssid"]   = isSTAMode ? WiFi.BSSIDstr() : "";
+    wf["rssi"]    = rssi;
+    wf["signal"]  = (rssi == 0) ? 0 : min(max(2 * (rssi + 100), 0), 100);
+    wf["channel"] = isSTAMode ? (int)WiFi.channel() : 0;
+    wf["ap"]      = !isSTAMode;
+
+    JsonObject fs = root.createNestedObject("fs");
+    fs["u"] = 10; fs["t"] = 1000; fs["pmt"] = 0;
+
+    root["time"] = "2026-01-01, 00:00:00";
+}
+
+static void addCORS() {
+    server.sendHeader("Access-Control-Allow-Origin",  "*");
+    server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+static void sendJson(int code, const String &body) {
+    addCORS();
+    server.send(code, "application/json", body);
+}
+
+// =============================================================================
+// SECTION 9: HTML PAGE
 // =============================================================================
 
 const char INDEX_HTML[] PROGMEM = R"rawhtml(
@@ -291,668 +315,511 @@ const char INDEX_HTML[] PROGMEM = R"rawhtml(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Clock Spinner</title>
+<title>ClockSpinner</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
-    background: #0d0d1a;
-    color: #e0e0e0;
+    background: #0d0d1a; color: #e0e0e0;
     font-family: system-ui, -apple-system, sans-serif;
-    min-height: 100vh;
-    display: flex;
-    align-items: flex-start;
-    justify-content: center;
     padding: 24px 16px 48px;
   }
-  .container { width: 100%; max-width: 480px; }
-  h1 {
-    font-size: 1.9rem;
-    font-weight: 700;
-    color: #7eb8f7;
-    text-align: center;
-    letter-spacing: 0.04em;
-    margin-bottom: 22px;
-  }
-  .card {
-    background: #141428;
-    border: 1px solid #2a2a4a;
-    border-radius: 14px;
-    padding: 18px 20px;
-    margin-bottom: 14px;
-  }
-  .card-title {
-    font-size: 0.72rem;
-    color: #555;
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-    margin-bottom: 12px;
-  }
-  .status-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 10px;
-  }
-  .badge {
-    display: inline-block;
-    padding: 4px 14px;
-    border-radius: 20px;
-    font-size: 0.78rem;
-    font-weight: 700;
-    letter-spacing: 0.1em;
-  }
+  .container { max-width: 480px; margin: 0 auto; }
+  h1 { font-size: 1.9rem; font-weight: 700; color: #7eb8f7; text-align: center;
+       letter-spacing: 0.04em; margin-bottom: 22px; }
+  .card { background: #141428; border: 1px solid #2a2a4a; border-radius: 14px;
+          padding: 18px 20px; margin-bottom: 14px; }
+  .card-title { font-size: 0.72rem; color: #555; text-transform: uppercase;
+                letter-spacing: 0.1em; margin-bottom: 12px; }
+  .info-row { display: flex; justify-content: space-between; align-items: center;
+              margin-bottom: 6px; font-size: 0.88rem; }
+  .info-key { color: #666; }
+  .info-val { color: #aaa; font-weight: 500; }
+  .info-val.good { color: #4cff88; }
+  .info-val.warn { color: #f7c97e; }
+  .badge { display: inline-block; padding: 4px 14px; border-radius: 20px;
+           font-size: 0.78rem; font-weight: 700; letter-spacing: 0.1em; }
   .badge-running { background: #0d3320; color: #4cff88; border: 1px solid #1a6640; }
   .badge-stopped { background: #330d0d; color: #ff4c4c; border: 1px solid #661a1a; }
-  .rpm-row {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 14px;
-    margin: 8px 0 4px;
-  }
-  .rpm-block { text-align: center; }
-  .rpm-big   { font-size: 2.3rem; font-weight: 700; color: #7eb8f7; line-height: 1; }
-  .rpm-mid   { font-size: 1.5rem; font-weight: 600; color: #4a7aaa; line-height: 1; }
-  .rpm-lbl   { font-size: 0.68rem; color: #555; text-transform: uppercase; letter-spacing: 0.08em; margin-top: 3px; }
-  .rpm-arrow { font-size: 1rem; color: #2a2a4a; }
-  .motor-info {
-    font-size: 0.72rem;
-    color: #444;
-    text-align: center;
-    margin-top: 5px;
-  }
-  .dir-display { font-size: 0.88rem; color: #777; text-align: center; margin-top: 5px; }
-  .dir-arrow   { color: #7eb8f7; }
-  .slider-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin: 10px 0 6px;
-  }
-  .s-lbl { font-size: 0.75rem; color: #555; min-width: 32px; }
+  .speed-big { font-size: 2.4rem; font-weight: 700; color: #7eb8f7;
+               text-align: center; margin: 8px 0 2px; }
+  .speed-unit { font-size: 0.85rem; color: #555; text-align: center; margin-bottom: 6px; }
+  .dir-line { font-size: 0.88rem; color: #777; text-align: center; }
+  .dir-arrow { color: #7eb8f7; }
+  .slider-row { display: flex; align-items: center; gap: 12px; margin: 10px 0 8px; }
   input[type=range] {
-    flex: 1;
-    -webkit-appearance: none;
-    appearance: none;
-    height: 6px;
-    border-radius: 3px;
-    background: #2a2a4a;
-    outline: none;
+    flex: 1; -webkit-appearance: none; appearance: none;
+    height: 6px; border-radius: 3px; background: #2a2a4a; outline: none;
   }
   input[type=range]::-webkit-slider-thumb {
-    -webkit-appearance: none;
-    appearance: none;
-    width: 22px; height: 22px;
-    border-radius: 50%;
-    background: #7eb8f7;
-    cursor: pointer;
-    border: 2px solid #0d0d1a;
+    -webkit-appearance: none; width: 22px; height: 22px;
+    border-radius: 50%; background: #7eb8f7; cursor: pointer; border: 2px solid #0d0d1a;
   }
   input[type=range]::-moz-range-thumb {
-    width: 22px; height: 22px;
-    border-radius: 50%;
-    background: #7eb8f7;
-    cursor: pointer;
-    border: 2px solid #0d0d1a;
+    width: 22px; height: 22px; border-radius: 50%;
+    background: #7eb8f7; cursor: pointer; border: 2px solid #0d0d1a;
   }
-  .s-val {
-    min-width: 56px;
-    text-align: right;
-    font-size: 0.95rem;
-    color: #7eb8f7;
-    font-weight: 600;
+  .slider-val { min-width: 52px; text-align: right; font-size: 1rem;
+                color: #7eb8f7; font-weight: 600; }
+  .btn-grid { display: grid; gap: 10px; margin-top: 8px; }
+  .col2 { grid-template-columns: 1fr 1fr; }
+  .col1 { grid-template-columns: 1fr; }
+  button, input[type=submit] {
+    padding: 13px 10px; border: none; border-radius: 10px;
+    font-size: 0.88rem; font-weight: 600; cursor: pointer;
+    letter-spacing: 0.03em; transition: opacity 0.15s, transform 0.1s;
+    width: 100%;
   }
-  .accel-hint {
-    font-size: 0.72rem;
-    color: #444;
-    text-align: center;
-    margin-top: 2px;
-    min-height: 1em;
-  }
-  .btn-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px; }
-  .btn-1 { display: grid; grid-template-columns: 1fr; gap: 10px; margin-top: 8px; }
-  button {
-    padding: 13px 10px;
-    border: none;
-    border-radius: 10px;
-    font-size: 0.88rem;
-    font-weight: 600;
-    cursor: pointer;
-    letter-spacing: 0.03em;
-    transition: opacity 0.15s, transform 0.1s;
-  }
-  button:active { opacity: 0.75; transform: scale(0.97); }
+  button:active, input[type=submit]:active { opacity: 0.75; transform: scale(0.97); }
   .btn-accent { background: #7eb8f7; color: #0d0d1a; }
   .btn-start  { background: #1a6640; color: #4cff88; border: 1px solid #2a9960; }
   .btn-stop   { background: #661a1a; color: #ff6666; border: 1px solid #993030; }
   .btn-dir    { background: #1e1e38; color: #7eb8f7; border: 1px solid #3a3a6a; }
-  .btn-save     { background: #1a3828; color: #7ef7a0; border: 1px solid #2a6040; }
-  .btn-defaults { background: #1e1a10; color: #f7c97e; border: 1px solid #6a4a10; }
-  /* Number inputs */
-  .field-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin: 10px 0;
-    gap: 10px;
+  .btn-save   { background: #1a3828; color: #7ef7a0; border: 1px solid #2a6040; }
+  .btn-reboot { background: #2a1a1a; color: #f7a07e; border: 1px solid #6a3010; }
+  label { display: block; font-size: 0.8rem; color: #888; margin-bottom: 5px; }
+  input[type=text], input[type=password] {
+    width: 100%; background: #0d0d1a; border: 1px solid #3a3a6a;
+    border-radius: 8px; color: #e0e0e0; font-size: 0.95rem;
+    padding: 10px 12px; outline: none; margin-bottom: 10px;
   }
-  .field-info { flex: 1; }
-  .field-label { font-size: 0.88rem; color: #ccc; }
-  .field-hint  { font-size: 0.7rem; color: #555; margin-top: 2px; }
-  input[type=number] {
-    width: 100px;
-    background: #0d0d1a;
-    border: 1px solid #3a3a6a;
-    border-radius: 8px;
-    color: #7eb8f7;
-    font-size: 1rem;
-    font-weight: 600;
-    padding: 8px 10px;
-    text-align: right;
-    outline: none;
-    flex-shrink: 0;
-    -moz-appearance: textfield;
-  }
-  input[type=number]::-webkit-inner-spin-button,
-  input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
-  input[type=number]:focus { border-color: #7eb8f7; }
-  /* Toggle */
-  .toggle-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin: 12px 0 4px;
-    gap: 10px;
-  }
-  .toggle-info .tgl-label { font-size: 0.88rem; color: #ccc; }
-  .toggle-info .tgl-hint  { font-size: 0.7rem;  color: #555; margin-top: 2px; }
-  .toggle { position: relative; width: 50px; height: 27px; flex-shrink: 0; }
-  .toggle input { opacity: 0; width: 0; height: 0; }
-  .tgl-slider {
-    position: absolute; inset: 0;
-    background: #2a2a4a;
-    border-radius: 27px;
-    cursor: pointer;
-    transition: background 0.2s;
-  }
-  .tgl-slider:before {
-    content: "";
-    position: absolute;
-    left: 3px; top: 3px;
-    width: 21px; height: 21px;
-    border-radius: 50%;
-    background: #555;
-    transition: transform 0.2s, background 0.2s;
-  }
-  .toggle input:checked + .tgl-slider { background: #1a4a30; }
-  .toggle input:checked + .tgl-slider:before { transform: translateX(23px); background: #4cff88; }
+  input[type=text]:focus, input[type=password]:focus { border-color: #7eb8f7; }
   .divider { border: none; border-top: 1px solid #1e1e38; margin: 12px 0; }
-  .status-line {
-    margin-top: 14px;
-    font-size: 0.7rem;
-    color: #3a3a5a;
-    text-align: center;
-    min-height: 1.1em;
-    word-break: break-all;
-  }
+  .status-line { margin-top: 14px; font-size: 0.7rem; color: #3a3a5a;
+                 text-align: center; min-height: 1.1em; word-break: break-all; }
 </style>
 </head>
 <body>
 <div class="container">
   <h1>Clock Spinner</h1>
 
-  <!-- STATUS -->
+  <!-- DEVICE INFO -->
   <div class="card">
-    <div class="status-row">
-      <span class="card-title" style="margin-bottom:0">Status</span>
+    <div class="card-title">Device</div>
+    <div class="info-row">
+      <span class="info-key">Name</span>
+      <span class="info-val" id="devName">—</span>
+    </div>
+    <div class="info-row">
+      <span class="info-key">AP address</span>
+      <span class="info-val good">192.168.4.1</span>
+    </div>
+    <div class="info-row">
+      <span class="info-key">Network IP</span>
+      <span class="info-val" id="devIP">—</span>
+    </div>
+    <div class="info-row">
+      <span class="info-key">WiFi</span>
+      <span class="info-val" id="devWifi">—</span>
+    </div>
+  </div>
+
+  <!-- MOTOR STATUS -->
+  <div class="card">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+      <span class="card-title" style="margin-bottom:0">Motor</span>
       <span class="badge badge-stopped" id="statusBadge">STOPPED</span>
     </div>
-    <div class="rpm-row">
-      <div class="rpm-block">
-        <div class="rpm-big" id="curOutDisplay">0.0</div>
-        <div class="rpm-lbl">Current Output RPM</div>
-      </div>
-      <div class="rpm-arrow">&#8594;</div>
-      <div class="rpm-block">
-        <div class="rpm-mid" id="tgtOutDisplay">30.0</div>
-        <div class="rpm-lbl">Target Output RPM</div>
-      </div>
-    </div>
-    <div class="motor-info" id="motorInfo">Motor: — RPM</div>
-    <div class="dir-display">
+    <div class="speed-big" id="speedDisplay">30.0</div>
+    <div class="speed-unit">RPM</div>
+    <div class="dir-line">
       Direction: <span class="dir-arrow" id="dirArrow">&#8594;</span>
       <span id="dirLabel">Forward</span>
     </div>
   </div>
 
-  <!-- SPEED -->
+  <!-- SPEED CONTROL -->
   <div class="card">
-    <div class="card-title">Target Speed (Output RPM)</div>
+    <div class="card-title">Speed</div>
     <div class="slider-row">
-      <span class="s-lbl" id="sMinLbl">0.1</span>
-      <input type="range" id="rpmSlider" min="0.1" max="120" step="0.1" value="30">
-      <span class="s-val" id="sliderVal">30.0</span>
+      <input type="range" id="rpmSlider" min="0.5" max="120" step="0.5" value="30">
+      <span class="slider-val" id="sliderVal">30.0</span>
     </div>
-    <div class="btn-1">
+    <div class="btn-grid col1">
       <button class="btn-accent" onclick="sendSpeed()">Set Speed</button>
     </div>
   </div>
 
-  <!-- ACCELERATION -->
-  <div class="card">
-    <div class="card-title">Acceleration (Output RPM/sec)</div>
-    <div class="slider-row">
-      <span class="s-lbl">0.1</span>
-      <input type="range" id="accelSlider" min="0.1" max="20" step="0.1" value="5">
-      <span class="s-val" id="accelVal">5.0</span>
-    </div>
-    <div class="accel-hint" id="accelHint">Ramp time to target: —</div>
-  </div>
-
-  <!-- CONTROL -->
+  <!-- CONTROL BUTTONS -->
   <div class="card">
     <div class="card-title">Control</div>
-    <div class="btn-2">
+    <div class="btn-grid col2">
       <button class="btn-start" onclick="sendCmd('/start')">&#9654; Start</button>
       <button class="btn-stop"  onclick="sendCmd('/stop')">&#9646;&#9646; Stop</button>
     </div>
-    <div class="btn-1" style="margin-top:10px">
+    <div class="btn-grid col1" style="margin-top:10px">
       <button class="btn-dir" onclick="sendCmd('/direction')">&#8646; Reverse Direction</button>
     </div>
   </div>
 
-  <!-- SETTINGS -->
+  <!-- WIFI SETTINGS -->
   <div class="card">
-    <div class="card-title">System Settings</div>
+    <div class="card-title">WiFi Network</div>
+    <form method="POST" action="/settings/wifi">
+      <label for="ssid">Network SSID</label>
+      <input type="text" id="ssid" name="ssid" placeholder="Your WiFi name" autocomplete="off">
+      <label for="psk">Password</label>
+      <input type="password" id="psk" name="psk" placeholder="WiFi password" autocomplete="off">
+      <input type="submit" class="btn-save" value="&#10003; Save WiFi &amp; Reboot">
+    </form>
+  </div>
 
-    <div class="field-row">
-      <div class="field-info">
-        <div class="field-label">Gear Ratio (output / motor)</div>
-        <div class="field-hint">e.g. 0.1 &rarr; 1 motor turn = 0.1 output turns</div>
-      </div>
-      <input type="number" id="gearRatioInput" step="0.001" min="0.001" value="1.000">
-    </div>
+  <!-- DEVICE NAME -->
+  <div class="card">
+    <div class="card-title">Device Name</div>
+    <label for="nameInput">Shown in Nebula app</label>
+    <input type="text" id="nameInput" placeholder="MotorController" autocomplete="off">
+    <button class="btn-save" onclick="saveName()">&#10003; Save Name</button>
+  </div>
 
-    <div class="field-row">
-      <div class="field-info">
-        <div class="field-label">Max Output RPM</div>
-        <div class="field-hint">Speed slider upper limit</div>
-      </div>
-      <input type="number" id="maxRpmInput" step="0.1" min="0.1" value="120.0">
-    </div>
-
-    <div class="field-row">
-      <div class="field-info">
-        <div class="field-label">Start Speed (output RPM)</div>
-        <div class="field-hint">Launch speed on Start — must be high enough to move the load. Set equal to target to match pre-acceleration behavior.</div>
-      </div>
-      <input type="number" id="startRpmInput" step="0.1" min="0.1" value="30.0">
-    </div>
-
-    <hr class="divider">
-
-    <div class="toggle-row">
-      <div class="toggle-info">
-        <div class="tgl-label">Auto-Start on Power-Up</div>
-        <div class="tgl-hint">Motor spins immediately when board powers on</div>
-      </div>
-      <label class="toggle">
-        <input type="checkbox" id="autostartToggle" checked>
-        <span class="tgl-slider"></span>
-      </label>
-    </div>
-
-    <div class="btn-1" style="margin-top:14px">
-      <button class="btn-save" onclick="saveSettings()">&#10003; Save All Settings</button>
-    </div>
-    <div class="btn-1" style="margin-top:8px">
-      <button class="btn-defaults" onclick="restoreDefaults()">&#8635; Restore Factory Defaults</button>
-    </div>
+  <!-- REBOOT -->
+  <div class="card">
+    <button class="btn-reboot" onclick="if(confirm('Reboot device?')) sendCmd('/reset')">
+      &#8635; Reboot Device
+    </button>
   </div>
 
   <div class="status-line" id="statusLine">Connecting…</div>
 </div>
 
 <script>
-  const rpmSlider   = document.getElementById('rpmSlider');
-  const accelSlider = document.getElementById('accelSlider');
-
-  rpmSlider.addEventListener('input', () => {
-    document.getElementById('sliderVal').textContent = parseFloat(rpmSlider.value).toFixed(1);
-    updateAccelHint();
+  const slider = document.getElementById('rpmSlider');
+  slider.addEventListener('input', () => {
+    document.getElementById('sliderVal').textContent = parseFloat(slider.value).toFixed(1);
   });
 
-  accelSlider.addEventListener('input', () => {
-    document.getElementById('accelVal').textContent = parseFloat(accelSlider.value).toFixed(1);
-    updateAccelHint();
-  });
+  function setStatus(msg) { document.getElementById('statusLine').textContent = msg; }
 
-  function updateAccelHint() {
-    const target = parseFloat(rpmSlider.value);
-    const accel  = parseFloat(accelSlider.value);
-    if (accel > 0) {
-      const secs = ((target - 0.1) / accel).toFixed(1);
-      document.getElementById('accelHint').textContent = 'Ramp time to target: ~' + secs + 's';
+  function updateMotorUI(data) {
+    if (document.activeElement !== slider) {
+      slider.value = data.rpm;
+      document.getElementById('sliderVal').textContent = parseFloat(data.rpm).toFixed(1);
     }
-  }
-
-  function updateUI(data) {
-    // Current and target output RPM
-    const curOut = parseFloat(data.outputRpm  || 0).toFixed(1);
-    const tgtOut = parseFloat(data.targetOutputRpm || 0).toFixed(1);
-    document.getElementById('curOutDisplay').textContent = curOut;
-    document.getElementById('tgtOutDisplay').textContent = tgtOut;
-
-    // Motor RPM info line
-    const motorRpm = parseFloat(data.motorRpm || 0).toFixed(1);
-    document.getElementById('motorInfo').textContent = 'Motor: ' + motorRpm + ' RPM';
-
-    // Update slider max and value — skip if user is actively dragging
-    if (data.maxOutputRpm) {
-      rpmSlider.max = data.maxOutputRpm;
-    }
-    if (document.activeElement !== rpmSlider) {
-      rpmSlider.value = data.targetOutputRpm || tgtOut;
-      document.getElementById('sliderVal').textContent = tgtOut;
-    }
-
-    // Accel slider — skip if user is actively dragging it
-    if (data.accel !== undefined && document.activeElement !== accelSlider) {
-      accelSlider.value = data.accel;
-      document.getElementById('accelVal').textContent = parseFloat(data.accel).toFixed(1);
-    }
-
-    // Number inputs — skip update entirely if the field has focus (user is typing)
-    const gearInput = document.getElementById('gearRatioInput');
-    const maxInput  = document.getElementById('maxRpmInput');
-    if (data.gearRatio !== undefined && document.activeElement !== gearInput) {
-      gearInput.value = parseFloat(data.gearRatio).toFixed(4);
-    }
-    if (data.maxOutputRpm !== undefined && document.activeElement !== maxInput) {
-      maxInput.value = parseFloat(data.maxOutputRpm).toFixed(1);
-    }
-    const startInput = document.getElementById('startRpmInput');
-    if (data.startOutputRpm !== undefined && document.activeElement !== startInput) {
-      startInput.value = parseFloat(data.startOutputRpm).toFixed(1);
-    }
-
-    // Auto-start toggle
-    if (data.autostart !== undefined) {
-      document.getElementById('autostartToggle').checked = data.autostart;
-    }
-
-    updateAccelHint();
-
-    // Status badge
+    document.getElementById('speedDisplay').textContent = parseFloat(data.rpm).toFixed(1);
     const badge = document.getElementById('statusBadge');
-    if (data.running) {
-      badge.textContent = 'RUNNING';
-      badge.className = 'badge badge-running';
-    } else {
-      badge.textContent = 'STOPPED';
-      badge.className = 'badge badge-stopped';
-    }
-
-    // Direction
+    badge.textContent = data.running ? 'RUNNING' : 'STOPPED';
+    badge.className   = data.running ? 'badge badge-running' : 'badge badge-stopped';
     const fwd = data.dir === 'fwd';
     document.getElementById('dirArrow').innerHTML = fwd ? '&#8594;' : '&#8592;';
     document.getElementById('dirLabel').textContent = fwd ? 'Forward' : 'Reverse';
   }
 
-  function setStatus(msg) {
-    document.getElementById('statusLine').textContent = msg;
+  function updateDeviceUI(info) {
+    document.getElementById('devName').textContent = info.name || '—';
+    document.getElementById('devIP').textContent   = info.ip || '—';
+    const wf = info.wifi;
+    if (wf && !wf.ap && wf.bssid) {
+      document.getElementById('devWifi').textContent = '&#10003; ' + (wf.bssid || 'connected');
+      document.getElementById('devWifi').classList.add('good');
+    } else {
+      document.getElementById('devWifi').textContent = 'AP only (not joined)';
+      document.getElementById('devWifi').classList.add('warn');
+    }
+    const ni = document.getElementById('nameInput');
+    if (document.activeElement !== ni) ni.value = info.name || '';
   }
 
   function fetchStatus() {
     fetch('/status')
-      .then(r => r.json())
-      .then(data => { updateUI(data); setStatus('Updated ' + new Date().toLocaleTimeString()); })
-      .catch(e => setStatus('Error: ' + e));
+      .then(r => r.json()).then(updateMotorUI)
+      .catch(e => setStatus('Motor status error: ' + e));
+  }
+
+  function fetchInfo() {
+    fetch('/json/info')
+      .then(r => r.json()).then(updateDeviceUI)
+      .catch(() => {});
   }
 
   function sendCmd(path) {
     fetch(path, { method: 'POST' })
       .then(r => r.json())
-      .then(data => { setStatus(path + ' \u2192 ' + JSON.stringify(data)); fetchStatus(); })
+      .then(d => { setStatus(path + ' \u2192 ' + JSON.stringify(d)); fetchStatus(); })
       .catch(e => setStatus('Error: ' + e));
   }
 
   function sendSpeed() {
-    const rpm = rpmSlider.value;
     fetch('/speed', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: 'rpm=' + rpm
-    })
-      .then(r => r.json())
-      .then(data => { setStatus('/speed \u2192 ' + JSON.stringify(data)); fetchStatus(); })
+      body: 'rpm=' + slider.value
+    }).then(r => r.json())
+      .then(d => { setStatus('/speed \u2192 ' + JSON.stringify(d)); fetchStatus(); })
       .catch(e => setStatus('Error: ' + e));
   }
 
-  function saveSettings() {
-    const accel     = accelSlider.value;
-    const autostart = document.getElementById('autostartToggle').checked ? '1' : '0';
-    const ratio     = document.getElementById('gearRatioInput').value;
-    const maxRpm    = document.getElementById('maxRpmInput').value;
-    const startRpm  = document.getElementById('startRpmInput').value;
-    const body = 'accel=' + accel
-               + '&autostart=' + autostart
-               + '&gearRatio=' + ratio
-               + '&maxOutputRpm=' + maxRpm
-               + '&startOutputRpm=' + startRpm;
-    fetch('/settings', {
+  function saveName() {
+    const name = document.getElementById('nameInput').value.trim();
+    if (!name) return;
+    fetch('/settings/ui', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: body
-    })
-      .then(r => r.json())
-      .then(data => { setStatus('/settings \u2192 ' + JSON.stringify(data)); fetchStatus(); })
-      .catch(e => setStatus('Error: ' + e));
-  }
-
-  function restoreDefaults() {
-    if (!confirm('Reset all settings to factory defaults?')) return;
-    fetch('/defaults', { method: 'POST' })
-      .then(r => r.json())
-      .then(data => { setStatus('Defaults restored \u2192 ' + JSON.stringify(data)); fetchStatus(); })
+      body: 'name=' + encodeURIComponent(name)
+    }).then(r => r.json())
+      .then(() => { setStatus('Name saved'); fetchInfo(); })
       .catch(e => setStatus('Error: ' + e));
   }
 
   fetchStatus();
+  fetchInfo();
   setInterval(fetchStatus, 3000);
+  setInterval(fetchInfo, 10000);
 </script>
 </body>
 </html>
 )rawhtml";
 
 // =============================================================================
-// SECTION 8: WEB HANDLERS
+// SECTION 10: WEB SERVER ROUTES
 // =============================================================================
 
-void handleRoot() {
-    server.send(200, "text/html", INDEX_HTML);
-}
+void setupRoutes() {
 
-void handleSpeed() {
-    if (server.hasArg("rpm")) {
-        float outputRpm = server.arg("rpm").toFloat();
-        setSpeed(outputRpm);
-        server.send(200, "application/json",
-            "{\"ok\":true,\"targetOutputRpm\":" + String(targetOutputRpm, 2) +
-            ",\"targetMotorRpm\":"              + String((float)targetMotorRpm, 2) + "}");
-    } else {
-        server.send(400, "application/json", "{\"ok\":false}");
-    }
-}
-
-void handleStart() {
-    startMotor();
-    server.send(200, "application/json", "{\"ok\":true}");
-}
-
-void handleStop() {
-    stopMotor();
-    server.send(200, "application/json", "{\"ok\":true}");
-}
-
-void handleDirection() {
-    dirForward = !dirForward;
-    if (motorRunning) applyDirection();
-    saveSettings();
-    server.send(200, "application/json",
-        String("{\"ok\":true,\"dir\":\"") + (dirForward ? "fwd" : "rev") + "\"}");
-}
-
-void handleSettings() {
-    bool changed = false;
-
-    if (server.hasArg("gearRatio")) {
-        float r = server.arg("gearRatio").toFloat();
-        if (r > 0.0f) {
-            gearRatio = r;
-            // Recalculate motor target with new ratio
-            targetMotorRpm = outputToMotor(targetOutputRpm);
-            changed = true;
+    // OPTIONS catch-all — CORS preflight for all paths
+    server.onNotFound([]() {
+        if (server.method() == HTTP_OPTIONS) {
+            addCORS();
+            server.send(200, "text/plain", "");
+        } else {
+            server.send(404, "text/plain", "Not found");
         }
-    }
-    if (server.hasArg("maxOutputRpm")) {
-        float m = server.arg("maxOutputRpm").toFloat();
-        if (m > 0.0f) {
-            configMaxOutRpm = m;
-            // Clamp current target if it now exceeds the new max
-            if (targetOutputRpm > configMaxOutRpm) {
-                setSpeed(configMaxOutRpm);
+    });
+
+    // Root — config + motor control page
+    server.on("/", HTTP_GET, []() {
+        server.send_P(200, "text/html", INDEX_HTML);
+    });
+
+    // ---- Config endpoints ----------------------------------------
+
+    // POST /settings/wifi — save credentials and reboot
+    server.on("/settings/wifi", HTTP_POST, []() {
+        if (server.hasArg("ssid")) wifiSSID = server.arg("ssid");
+        if (server.hasArg("psk"))  wifiPass = server.arg("psk");
+        saveConfig();
+        server.send(200, "text/html",
+            "<html><body style='background:#0d0d1a;color:#e0e0e0;"
+            "font-family:sans-serif;text-align:center;padding:3rem'>"
+            "<h2 style='color:#7eb8f7'>&#10003; Saved!</h2>"
+            "<p>Rebooting now&hellip;</p></body></html>");
+        delay(500);
+        ESP.restart();
+    });
+
+    // POST /settings/ui — save device name (no reboot needed)
+    server.on("/settings/ui", HTTP_POST, []() {
+        if (server.hasArg("name")) {
+            deviceName = server.arg("name");
+            saveConfig();
+        }
+        sendJson(200, "{\"ok\":true}");
+    });
+
+    // POST /reset — reboot
+    server.on("/reset", HTTP_POST, []() {
+        server.send(200, "text/plain", "Rebooting...");
+        delay(500);
+        ESP.restart();
+    });
+
+    // ---- Motor control endpoints ---------------------------------
+
+    server.on("/status", HTTP_GET, []() {
+        sendJson(200, "{\"rpm\":"     + String(currentRpm, 1)
+                    + ",\"running\":" + (motorRunning ? "true" : "false")
+                    + ",\"dir\":\""   + (dirForward ? "fwd" : "rev") + "\"}");
+    });
+
+    server.on("/start", HTTP_POST, []() {
+        startMotor();
+        sendJson(200, "{\"ok\":true}");
+    });
+
+    server.on("/stop", HTTP_POST, []() {
+        stopMotor();
+        sendJson(200, "{\"ok\":true}");
+    });
+
+    server.on("/direction", HTTP_POST, []() {
+        dirForward = !dirForward;
+        if (motorRunning) applyDirection();
+        sendJson(200, String("{\"ok\":true,\"dir\":\"") + (dirForward ? "fwd" : "rev") + "\"}");
+    });
+
+    server.on("/speed", HTTP_POST, []() {
+        if (server.hasArg("rpm")) setSpeed(server.arg("rpm").toFloat());
+        sendJson(200, "{\"ok\":true,\"rpm\":" + String(currentRpm, 1) + "}");
+    });
+
+    // ---- WLED JSON API -------------------------------------------
+
+    // GET /json/info
+    server.on("/json/info", HTTP_GET, []() {
+        DynamicJsonDocument doc(2560);
+        populateInfo(doc.to<JsonObject>());
+        String out; serializeJson(doc, out);
+        sendJson(200, out);
+    });
+
+    // GET /json/state
+    server.on("/json/state", HTTP_GET, []() {
+        DynamicJsonDocument doc(1536);
+        populateState(doc.to<JsonObject>());
+        String out; serializeJson(doc, out);
+        sendJson(200, out);
+    });
+
+    // POST /json/state — raw JSON body via server.arg("plain")
+    // `on` maps to motor start/stop; `bri` stored but not yet mapped
+    server.on("/json/state", HTTP_POST, []() {
+        String body = server.arg("plain");
+        DynamicJsonDocument bodyDoc(256);
+        if (body.length() > 0 && deserializeJson(bodyDoc, body) == DeserializationError::Ok) {
+            if (bodyDoc.containsKey("on")) {
+                bool on = bodyDoc["on"].as<bool>();
+                if (on  && !motorRunning) startMotor();
+                if (!on &&  motorRunning) stopMotor();
             }
-            changed = true;
+            if (bodyDoc.containsKey("bri")) wledBri = bodyDoc["bri"].as<uint8_t>();
         }
-    }
-    if (server.hasArg("accel")) {
-        float a = server.arg("accel").toFloat();
-        if (a > 0.0f) {
-            accelRpmPerSec = constrain(a, 0.1f, 100.0f);
-            changed = true;
-        }
-    }
-    if (server.hasArg("startOutputRpm")) {
-        float s = server.arg("startOutputRpm").toFloat();
-        if (s > 0.0f) {
-            startOutputRpm = constrain(s, 0.0f, configMaxOutRpm);
-            changed = true;
-        }
-    }
-    if (server.hasArg("autostart")) {
-        bootAutoStart = (server.arg("autostart") == "1" || server.arg("autostart") == "true");
-        changed = true;
-    }
+        DynamicJsonDocument resp(1536);
+        populateState(resp.to<JsonObject>());
+        String out; serializeJson(resp, out);
+        sendJson(200, out);
+    });
 
-    if (changed) saveSettings();
+    // GET /json — combined state + info + effects + palettes
+    server.on("/json", HTTP_GET, []() {
+        DynamicJsonDocument doc(5120);
+        JsonObject root = doc.to<JsonObject>();
+        populateState(root.createNestedObject("state"));
+        populateInfo(root.createNestedObject("info"));
+        root.createNestedArray("effects").add("Solid");
+        root.createNestedArray("palettes").add("Default");
+        String out; serializeJson(doc, out);
+        sendJson(200, out);
+    });
 
-    server.send(200, "application/json",
-        "{\"ok\":true"
-        ",\"gearRatio\":"      + String(gearRatio, 4) +
-        ",\"maxOutputRpm\":"   + String(configMaxOutRpm, 1) +
-        ",\"startOutputRpm\":" + String(startOutputRpm, 1) +
-        ",\"accel\":"          + String(accelRpmPerSec, 1) +
-        ",\"autostart\":"      + (bootAutoStart ? "true" : "false") + "}");
-}
+    // GET /json/effects
+    server.on("/json/effects",  HTTP_GET, []() { sendJson(200, "[\"Solid\"]");   });
+    // GET /json/palettes
+    server.on("/json/palettes", HTTP_GET, []() { sendJson(200, "[\"Default\"]"); });
 
-void handleDefaults() {
-    // Reset every setting to the compile-time defaults — same state as before
-    // acceleration was added. startOutputRpm == targetOutputRpm means the motor
-    // launches at full speed instantly, giving maximum torque to overcome inertia.
-    targetOutputRpm = DEFAULT_TARGET_RPM;
-    startOutputRpm  = DEFAULT_START_RPM;   // = DEFAULT_TARGET_RPM = 30 RPM
-    accelRpmPerSec  = DEFAULT_ACCEL;
-    gearRatio       = DEFAULT_GEAR_RATIO;
-    configMaxOutRpm = DEFAULT_MAX_OUT_RPM;
-    bootAutoStart   = true;
-    dirForward      = true;
-    targetMotorRpm  = outputToMotor(targetOutputRpm);
-    saveSettings();
-    Serial.println("handleDefaults: all settings reset to factory defaults");
-    server.send(200, "application/json",
-        "{\"ok\":true"
-        ",\"targetOutputRpm\":" + String(targetOutputRpm, 1) +
-        ",\"startOutputRpm\":"  + String(startOutputRpm, 1) +
-        ",\"accel\":"           + String(accelRpmPerSec, 1) +
-        ",\"gearRatio\":"       + String(gearRatio, 4) +
-        ",\"maxOutputRpm\":"    + String(configMaxOutRpm, 1) +
-        ",\"autostart\":true,\"dir\":\"fwd\"}");
-}
+    // GET /win — WLED legacy XML API
+    server.on("/win", HTTP_GET, []() {
+        String name = deviceName;
+        name.replace("&", "&amp;"); name.replace("<", "&lt;"); name.replace(">", "&gt;");
+        String xml =
+            "<?xml version=\"1.0\" ?><vs>"
+            "<ac>" + String(wledBri) + "</ac>"
+            "<cl>128</cl><cl>0</cl><cl>0</cl>"
+            "<cs>0</cs><cs>0</cs><cs>0</cs>"
+            "<ns>0</ns><nr>0</nr><nl>0</nl><nf>0</nf><nd>0</nd><nt>0</nt>"
+            "<sq>0</sq><gn>0</gn><fx>0</fx><sx>128</sx><ix>128</ix>"
+            "<f1>0</f1><f2>0</f2><f3>0</f3><fp>0</fp>"
+            "<wv>-1</wv><ws>0</ws><ps>0</ps><cy>0</cy>"
+            "<ds>" + name + "</ds>"
+            "<ss>0</ss></vs>";
+        server.send(200, "text/xml", xml);
+    });
 
-void handleStatus() {
-    float curOut = motorToOutput(currentMotorRpm);
-    String json =
-        "{\"outputRpm\":"       + String(curOut, 2) +
-        ",\"targetOutputRpm\":" + String(targetOutputRpm, 2) +
-        ",\"motorRpm\":"        + String((float)currentMotorRpm, 2) +
-        ",\"running\":"         + (motorRunning ? "true" : "false") +
-        ",\"dir\":\""           + (dirForward ? "fwd" : "rev") + "\"" +
-        ",\"accel\":"           + String(accelRpmPerSec, 1) +
-        ",\"autostart\":"       + (bootAutoStart ? "true" : "false") +
-        ",\"gearRatio\":"       + String(gearRatio, 4) +
-        ",\"maxOutputRpm\":"    + String(configMaxOutRpm, 1) +
-        ",\"startOutputRpm\":"  + String(startOutputRpm, 1) +
-        "}";
-    server.send(200, "application/json", json);
+    server.begin();
+    Serial.println("Web server started");
 }
 
 // =============================================================================
-// SECTION 9: setup()
+// SECTION 11: WIFI + mDNS SETUP
+// =============================================================================
+
+void setupWifi() {
+    // Always run the AP so the device is directly accessible even without network
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    Serial.printf("AP ready: %s — http://%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+
+    if (wifiSSID.length() == 0) {
+        Serial.println("No WiFi credentials stored — AP only mode");
+        Serial.println("Connect to ClockSpinner and open http://192.168.4.1 to configure");
+        return;
+    }
+
+    Serial.printf("Connecting to '%s'", wifiSSID.c_str());
+    WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+
+    unsigned long deadline = millis() + 12000;
+    while (WiFi.status() != WL_CONNECTED && millis() < deadline) {
+        delay(500);
+        Serial.print(".");
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("\nWiFi failed — AP only mode");
+        return;
+    }
+
+    isSTAMode = true;
+    Serial.printf("\nConnected! STA IP: %s\n", WiFi.localIP().toString().c_str());
+
+    // mDNS — hostname wled-XXXXXX (last 6 chars of MAC, lowercase).
+    // Nebula app discovers devices by scanning for _wled._tcp on the network.
+    String mac = WiFi.macAddress();
+    mac.replace(":", ""); mac.toLowerCase();
+    String mdnsName = "wled-" + mac.substring(6);
+
+    if (MDNS.begin(mdnsName.c_str())) {
+        MDNS.addService("http", "tcp", 80);
+        MDNS.addService("wled", "tcp", 80);                          // ← discovery hook
+        MDNS.addServiceTxt("wled", "tcp", "mac", mac.c_str());
+        MDNS.addServiceTxt("wled", "tcp", "ver", "0.15.0-b3");
+        MDNS.addServiceTxt("wled", "tcp", "ip",  WiFi.localIP().toString().c_str());
+        Serial.printf("mDNS: http://%s.local  (will appear in Nebula as '%s')\n",
+                      mdnsName.c_str(), deviceName.c_str());
+    } else {
+        Serial.println("mDNS start failed");
+    }
+}
+
+// =============================================================================
+// SECTION 12: setup()
 // =============================================================================
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("ClockSpinner booting...");
+    Serial.println("\nClockSpinner booting...");
 
     // Init shift register GPIO pins
-    pinMode(SR_BCK,  OUTPUT);
-    pinMode(SR_WS,   OUTPUT);
-    pinMode(SR_DATA, OUTPUT);
-    digitalWrite(SR_BCK,  LOW);
-    digitalWrite(SR_WS,   LOW);
-    digitalWrite(SR_DATA, LOW);
-
-    // Start with all outputs LOW, then explicitly disable motors
+    pinMode(SR_BCK,  OUTPUT); pinMode(SR_WS,   OUTPUT); pinMode(SR_DATA, OUTPUT);
+    digitalWrite(SR_BCK, LOW); digitalWrite(SR_WS, LOW); digitalWrite(SR_DATA, LOW);
     srState = 0;
     shiftOut32();
-    srWrite(BIT_ENABLE, true);
-    Serial.print("Shift register init: srState=0x");
-    Serial.println(srState, HEX);
+    srWrite(BIT_ENABLE, true);   // ENABLE HIGH = motors disabled at boot
+    Serial.printf("SR init: srState=0x%X\n", srState);
 
-    // Load persisted settings
-    loadSettings();
-
-    // Start Wi-Fi AP
-    WiFi.softAP(WIFI_SSID, WIFI_PASS);
-    Serial.print("AP IP: ");
-    Serial.println(WiFi.softAPIP());
-
-    // Register routes and start server
-    server.on("/",          HTTP_GET,  handleRoot);
-    server.on("/speed",     HTTP_POST, handleSpeed);
-    server.on("/start",     HTTP_POST, handleStart);
-    server.on("/stop",      HTTP_POST, handleStop);
-    server.on("/direction", HTTP_POST, handleDirection);
-    server.on("/settings",  HTTP_POST, handleSettings);
-    server.on("/defaults",  HTTP_POST, handleDefaults);
-    server.on("/status",    HTTP_GET,  handleStatus);
-    server.begin();
-    Serial.println("Web server started at http://192.168.4.1");
-
-    // Auto-start if configured
-    if (bootAutoStart) {
-        Serial.println("Auto-start: spinning up...");
-        startMotor();
+    // Mount LittleFS (format on first boot if needed)
+    if (!SPIFFS.begin(true)) {
+        Serial.println("LittleFS mount/format failed");
+    } else {
+        Serial.println("LittleFS mounted");
+        loadConfig();
     }
+
+    // WiFi (STA if credentials saved, always AP)
+    setupWifi();
+
+    // HTTP routes
+    setupRoutes();
+
+    // Auto-start motor
+    Serial.println("Auto-start: spinning up...");
+    startMotor();
+
+    Serial.println("Boot complete");
 }
 
 // =============================================================================
-// SECTION 10: loop()
+// SECTION 13: loop()
 // =============================================================================
 
 void loop() {
-    updateRamp();
     server.handleClient();
     delay(1);
 }
