@@ -1,0 +1,514 @@
+================================================================================
+  AGENT BUILD PROMPT — MKS DLC32 CONSTANT-SPEED STEPPER SPINNER
+  "ClockSpinner" firmware
+================================================================================
+
+TASK
+----
+You are an AI agent. Create a complete, ready-to-flash PlatformIO firmware
+project IN THE CURRENT WORKING DIRECTORY (the folder where this prompt file
+lives). Do not create a subfolder for the project — platformio.ini and the
+src/ directory go directly in this folder.
+
+When you are done, the user must be able to open this folder in VS Code /
+Cursor with the PlatformIO extension, hit "Upload", and have firmware running
+on their MKS DLC32 v2.1 board that spins both stepper motors at a constant
+speed they can set from a web page on their phone.
+
+Files to create (all paths relative to this folder):
+  platformio.ini
+  src/main.cpp
+
+That is it. Two files. No libraries to install. No external dependencies.
+Everything the firmware needs is already part of the Arduino ESP32 core.
+
+
+================================================================================
+HARDWARE — READ THIS CAREFULLY BEFORE WRITING ANY CODE
+================================================================================
+
+BOARD: MKS DLC32 v2.1
+  MCU:        ESP32 (Espressif ESP32-D0WD or similar dual-core)
+  Framework:  Arduino
+  PlatformIO board id: esp32dev
+  CPU clock:  160 MHz
+  Flash:      80 MHz, DOUT mode
+  Partitions: huge_app.csv  (already available in the Arduino ESP32 core)
+
+STEPPER DRIVERS:
+  The motor driver modules in the X and Y sockets are TMC2209-based running
+  in STANDALONE mode. No UART. No SPI. They accept plain STEP / DIR / ENABLE
+  signals exactly like an A4988 or DRV8825.
+
+  - ENABLE is ACTIVE LOW. Pull ENABLE LOW to power the motor. Pull HIGH to
+    release it (freewheel / de-energize).
+  - A valid step pulse: bring STEP HIGH, hold for at least 10 µs, bring LOW.
+  - Direction is set on DIR before or at the same time as the STEP rising edge.
+  - Microstepping is 16x set by hardware jumpers on the board.
+  - A standard 200-step/rev stepper motor at 16x = 3200 microsteps/revolution.
+
+
+================================================================================
+CRITICAL — THE SHIFT REGISTER (THIS IS WHY STANDARD STEPPER LIBS WON'T WORK)
+================================================================================
+
+The STEP / DIR / ENABLE signals on the MKS DLC32 are NOT connected to direct
+ESP32 GPIO pins. They route through a chain of 74HC595 shift registers.
+
+Only three real ESP32 GPIO pins are involved:
+  GPIO 16  —  Shift register bit clock  (BCK / SCK / SRCLK)
+  GPIO 17  —  Shift register latch      (WS  / RCLK / STCP)
+  GPIO 21  —  Shift register data       (DATA / SER  / DS)
+
+The shift registers present 32 output bits total. Each bit index controls one
+physical signal on the board:
+
+  Bit index  Signal
+  ---------  ------
+  0          ENABLE  (shared by X, Y, and Z — one enable for all axes)
+  1          X STEP
+  2          X DIR
+  3          Z STEP  (not used in this project)
+  4          Z DIR   (not used)
+  5          Y STEP
+  6          Y DIR
+  7          BEEPER  (not used)
+  8-31       other board functions, leave at 0
+
+Data is clocked out MSB-first (bit 31 first, bit 0 last). The latch pin (GPIO 17)
+must pulse HIGH after all 32 bits have been clocked to update the physical outputs.
+
+IMPLEMENT THE SHIFT REGISTER LIKE THIS (copy this exactly into src/main.cpp):
+
+  #define SR_BCK   16
+  #define SR_WS    17
+  #define SR_DATA  21
+
+  #define BIT_ENABLE  0
+  #define BIT_X_STEP  1
+  #define BIT_X_DIR   2
+  #define BIT_Y_STEP  5
+  #define BIT_Y_DIR   6
+
+  static volatile uint32_t srState = 0;
+  static portMUX_TYPE srMux = portMUX_INITIALIZER_UNLOCKED;
+
+  // Clock the current srState out to the shift registers (MSB first, then latch).
+  // Must be called with srMux held (or from a context where no conflict exists).
+  void IRAM_ATTR shiftOut32() {
+      digitalWrite(SR_WS, LOW);
+      uint32_t s = srState;          // local copy — srState is volatile
+      for (int i = 31; i >= 0; i--) {
+          digitalWrite(SR_DATA, (s >> i) & 1);
+          digitalWrite(SR_BCK, HIGH);
+          digitalWrite(SR_BCK, LOW);
+      }
+      digitalWrite(SR_WS, HIGH);    // latch outputs
+  }
+
+  // Set or clear one bit in srState from the main thread (NOT from ISR).
+  // Uses portENTER_CRITICAL so the ISR cannot interrupt mid-update.
+  void srWrite(uint8_t bitIndex, bool val) {
+      portENTER_CRITICAL(&srMux);
+      if (val) srState |=  (1UL << bitIndex);
+      else     srState &= ~(1UL << bitIndex);
+      shiftOut32();
+      portEXIT_CRITICAL(&srMux);
+  }
+
+This replaces any need for a library. It is the same logic used internally
+by the original Grbl_ESP32 firmware's shift register fallback code.
+
+IMPORTANT — srMux usage rules:
+  - srWrite()  uses portENTER_CRITICAL    — call this from loop() / web handlers
+  - The step ISR uses portENTER_CRITICAL_ISR — and directly manipulates srState
+    then calls shiftOut32() (see ISR section below). Do NOT call srWrite()
+    from inside the ISR.
+
+NOTE on speed: at 120 RPM with 3200 steps/rev the step ISR fires ~6400 times
+per second. Each shiftOut32() call clocks 32 bits. At Arduino digitalWrite
+speed (~150 ns per call on ESP32 at 160 MHz) each shiftOut32() takes ~10 µs.
+The ISR calls shiftOut32() exactly TWICE per step (once high, once low),
+giving a total ISR time of ~30 µs — well within the 156 µs available at
+max RPM, leaving ~80% CPU headroom for the web server and Wi-Fi stack.
+
+
+================================================================================
+STEP GENERATION
+================================================================================
+
+Use an ESP32 hardware timer to fire an ISR at the step frequency.
+
+MATH:
+  STEPS_PER_REV = 3200          // 200 full steps × 16 microsteps
+  step_freq_hz  = (rpm / 60.0) × STEPS_PER_REV
+  step_period_us = 1,000,000 / step_freq_hz
+
+SPEED RANGE:
+  MIN_RPM = 0.5   (very slow creep for testing)
+  MAX_RPM = 120   (safe upper limit for clock mechanism)
+
+ISR LOGIC (IRAM_ATTR, called at step_freq_hz):
+  IMPORTANT: Do NOT call srWrite() from the ISR (it uses portENTER_CRITICAL
+  which cannot be nested inside portENTER_CRITICAL_ISR). Instead, manipulate
+  srState bits directly and call shiftOut32() only twice per step:
+
+    portENTER_CRITICAL_ISR(&srMux);
+    srState |=  (1UL << BIT_X_STEP) | (1UL << BIT_Y_STEP);   // both HIGH at once
+    shiftOut32();                                               // one shift-out HIGH
+    delayMicroseconds(10);                                     // hold for 10 µs
+    srState &= ~((1UL << BIT_X_STEP) | (1UL << BIT_Y_STEP));  // both LOW at once
+    shiftOut32();                                               // one shift-out LOW
+    portEXIT_CRITICAL_ISR(&srMux);
+
+  This gives exactly 2 shiftOut32() calls per ISR tick (~20 µs total),
+  not 4 — which is the key to staying within the step period budget at high RPM.
+  Both X and Y step bits rise and fall simultaneously in the same shift-out.
+
+TIMER SETUP (in startMotor()):
+  stepTimer = timerBegin(0, 80, true);          // timer 0, 80 prescaler → 1 µs tick
+  timerAttachInterrupt(stepTimer, &onStep, true);
+  timerAlarmWrite(stepTimer, period_us, true);  // auto-reload
+  timerAlarmEnable(stepTimer);
+
+CHANGING SPEED (in setSpeed()):
+  Just call timerAlarmWrite(stepTimer, newPeriodUs, true).
+  No need to stop/start the timer. This takes effect on the next alarm.
+  Clamp the input to [MIN_RPM, MAX_RPM] before converting to period.
+
+DIRECTION:
+  Store a bool dirForward. On start or direction change:
+    srWrite(BIT_X_DIR, dirForward ? 1 : 0);
+    srWrite(BIT_Y_DIR, dirForward ? 1 : 0);
+  Both axes always get the same DIR value.
+
+ENABLE / DISABLE:
+  Enable  motors: srWrite(BIT_ENABLE, LOW)    // active low
+  Disable motors: srWrite(BIT_ENABLE, HIGH)
+
+
+================================================================================
+WI-FI AND WEB SERVER
+================================================================================
+
+MODE: Soft Access Point (AP). The ESP32 creates its own Wi-Fi hotspot.
+No router needed. User connects their phone/laptop directly.
+
+  SSID:     "ClockSpinner"
+  Password: "clockwork"
+  IP:       192.168.4.1  (default ESP32 AP address, no configuration needed)
+
+LIBRARY: WebServer  — built into the Arduino ESP32 core, no install required.
+  #include <WiFi.h>
+  #include <WebServer.h>
+  WebServer server(80);
+
+ROUTES:
+  GET  /          Serve the HTML control page
+  POST /speed     Body param "rpm" (float). Set speed. Returns JSON.
+  POST /start     Enable motors and start timer. Returns JSON.
+  POST /stop      Stop timer and disable motors. Returns JSON.
+  POST /direction Toggle direction. Returns JSON.
+  GET  /status    Return JSON: {"rpm":X,"running":true,"dir":"fwd"}
+
+SETUP:
+  WiFi.softAP("ClockSpinner", "clockwork");
+  server.on("/",         HTTP_GET,  handleRoot);
+  server.on("/speed",    HTTP_POST, handleSpeed);
+  server.on("/start",    HTTP_POST, handleStart);
+  server.on("/stop",     HTTP_POST, handleStop);
+  server.on("/direction",HTTP_POST, handleDirection);
+  server.on("/status",   HTTP_GET,  handleStatus);
+  server.begin();
+
+In loop(): server.handleClient();
+
+
+================================================================================
+HTML PAGE (served from handleRoot)
+================================================================================
+
+Serve a complete self-contained HTML page as a C++ raw string literal (R"(...)").
+No SPIFFS. No files. The entire HTML is a string in main.cpp.
+
+The page must work well on a mobile phone browser. Keep it clean and minimal.
+
+Design requirements:
+  - Background: #0d0d1a (very dark blue-black)
+  - Text: #e0e0e0
+  - Accent color: #7eb8f7 (soft blue)
+  - Font: system-ui or sans-serif
+  - Centered layout, max-width 480px, padding 24px
+
+Elements:
+  1. Title: "Clock Spinner" in large text
+  2. Status indicator: shows "RUNNING" (green) or "STOPPED" (red)
+  3. Current speed display: e.g., "12.5 RPM"
+  4. Range slider: min=0.5, max=120, step=0.5
+     - Show the numeric value next to it, updating live as slider moves
+  5. "Set Speed" button — sends slider value to POST /speed
+  6. "Start" button — POST /start
+  7. "Stop" button  — POST /stop
+  8. "Reverse Direction" button — POST /direction, updates a "Direction: →" label
+  9. Small status line at the bottom showing last server response
+
+JavaScript requirements:
+  - On page load: fetch /status and populate all fields
+  - Auto-refresh: fetch /status every 3 seconds, update display
+  - All buttons use fetch() with method: "POST"
+  - Speed slider updates its numeric label in real-time (oninput event)
+  - No external dependencies (no jQuery, no CDN links)
+  - Keep JS concise (no frameworks)
+
+
+================================================================================
+COMPLETE src/main.cpp STRUCTURE
+================================================================================
+
+Write main.cpp with these sections in order:
+
+--- SECTION 1: INCLUDES AND DEFINES ---
+  #include <Arduino.h>
+  #include <WiFi.h>
+  #include <WebServer.h>
+
+  // Shift register pins
+  #define SR_BCK   16
+  #define SR_WS    17
+  #define SR_DATA  21
+
+  // Shift register bit indices
+  #define BIT_ENABLE  0
+  #define BIT_X_STEP  1
+  #define BIT_X_DIR   2
+  #define BIT_Y_STEP  5
+  #define BIT_Y_DIR   6
+
+  // Motor config
+  #define STEPS_PER_REV  3200    // 200 full steps × 16x microstepping
+  #define MIN_RPM        0.5f
+  #define MAX_RPM        120.0f
+  #define DEFAULT_RPM    10.0f
+
+  // Wi-Fi
+  #define WIFI_SSID  "ClockSpinner"
+  #define WIFI_PASS  "clockwork"
+
+--- SECTION 2: GLOBALS ---
+  static volatile uint32_t srState = 0;
+  static portMUX_TYPE      srMux   = portMUX_INITIALIZER_UNLOCKED;
+  volatile float  currentRpm   = DEFAULT_RPM;
+  volatile bool   motorRunning = false;
+  volatile bool   dirForward   = true;
+  hw_timer_t*     stepTimer    = nullptr;
+  WebServer       server(80);
+
+--- SECTION 3: SHIFT REGISTER FUNCTIONS ---
+  void IRAM_ATTR shiftOut32()   — as specified above (takes local copy of srState)
+  void           srWrite(bit, val) — main-thread version, uses portENTER_CRITICAL(&srMux)
+
+--- SECTION 4: MOTOR HELPERS ---
+  uint32_t rpmToMicros(float rpm)     — returns (uint32_t)(1e6f / ((rpm / 60.0f) * STEPS_PER_REV))
+  void applyDirection()               — srWrite X_DIR and Y_DIR from dirForward
+  void enableMotors()                 — srWrite BIT_ENABLE, LOW
+  void disableMotors()                — srWrite BIT_ENABLE, HIGH
+
+--- SECTION 5: STEP ISR ---
+  void IRAM_ATTR onStep() {
+      // DO NOT call srWrite() here — use portENTER_CRITICAL_ISR + direct bit ops
+      portENTER_CRITICAL_ISR(&srMux);
+      srState |=  (1UL << BIT_X_STEP) | (1UL << BIT_Y_STEP);
+      shiftOut32();
+      delayMicroseconds(10);
+      srState &= ~((1UL << BIT_X_STEP) | (1UL << BIT_Y_STEP));
+      shiftOut32();
+      portEXIT_CRITICAL_ISR(&srMux);
+  }
+  // This calls shiftOut32() exactly twice per step — ~20 µs ISR time total.
+  // At 120 RPM (156 µs period) this leaves ~87% of the period free for Wi-Fi.
+
+--- SECTION 6: START / STOP / SET SPEED ---
+  void startMotor() {
+      if (motorRunning) return;
+      applyDirection();
+      enableMotors();
+      stepTimer = timerBegin(0, 80, true);
+      timerAttachInterrupt(stepTimer, &onStep, true);
+      timerAlarmWrite(stepTimer, rpmToMicros(currentRpm), true);
+      timerAlarmEnable(stepTimer);
+      motorRunning = true;
+  }
+
+  void stopMotor() {
+      if (!motorRunning) return;
+      timerAlarmDisable(stepTimer);
+      timerDetachInterrupt(stepTimer);
+      timerEnd(stepTimer);
+      stepTimer = nullptr;
+      disableMotors();
+      motorRunning = false;
+  }
+
+  void setSpeed(float rpm) {
+      rpm = constrain(rpm, MIN_RPM, MAX_RPM);
+      currentRpm = rpm;
+      if (motorRunning && stepTimer != nullptr) {
+          timerAlarmWrite(stepTimer, rpmToMicros(rpm), true);
+      }
+  }
+
+--- SECTION 7: HTML PAGE ---
+  const char INDEX_HTML[] PROGMEM = R"rawhtml(
+  <!DOCTYPE html>
+  ... full HTML page here ...
+  )rawhtml";
+
+  Write the complete HTML with all required elements described above.
+  The HTML should be attractive, functional, and fully self-contained.
+
+--- SECTION 8: WEB HANDLERS ---
+
+  handleRoot():
+    server.send(200, "text/html", INDEX_HTML);
+
+  handleSpeed():
+    if server.hasArg("rpm"):
+        float rpm = server.arg("rpm").toFloat()
+        setSpeed(rpm)
+        server.send(200, "application/json",
+            "{\"ok\":true,\"rpm\":" + String(currentRpm, 1) + "}")
+    else:
+        server.send(400, "application/json", "{\"ok\":false}")
+
+  handleStart():
+    startMotor()
+    server.send(200, "application/json", "{\"ok\":true}")
+
+  handleStop():
+    stopMotor()
+    server.send(200, "application/json", "{\"ok\":true}")
+
+  handleDirection():
+    dirForward = !dirForward
+    if (motorRunning) applyDirection()
+    server.send(200, "application/json",
+        String("{\"ok\":true,\"dir\":\"") + (dirForward ? "fwd" : "rev") + "\"}")
+
+  handleStatus():
+    Build and send JSON with currentRpm, motorRunning, dirForward
+
+--- SECTION 9: setup() ---
+  Serial.begin(115200);
+  Serial.println("ClockSpinner booting...");
+
+  // Init shift register GPIO pins
+  pinMode(SR_BCK,  OUTPUT);
+  pinMode(SR_WS,   OUTPUT);
+  pinMode(SR_DATA, OUTPUT);
+  digitalWrite(SR_BCK,  LOW);
+  digitalWrite(SR_WS,   LOW);
+  digitalWrite(SR_DATA, LOW);
+
+  // Start with all outputs LOW (motors disabled)
+  srState = 0;
+  shiftOut32();
+  // Explicitly disable motors (ENABLE HIGH = disabled)
+  srWrite(BIT_ENABLE, HIGH);
+
+  // Start Wi-Fi AP
+  WiFi.softAP(WIFI_SSID, WIFI_PASS);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Register routes and start server
+  server.on("/",          HTTP_GET,  handleRoot);
+  server.on("/speed",     HTTP_POST, handleSpeed);
+  server.on("/start",     HTTP_POST, handleStart);
+  server.on("/stop",      HTTP_POST, handleStop);
+  server.on("/direction", HTTP_POST, handleDirection);
+  server.on("/status",    HTTP_GET,  handleStatus);
+  server.begin();
+  Serial.println("Web server started at http://192.168.4.1");
+
+--- SECTION 10: loop() ---
+  server.handleClient();
+  delay(1);
+
+
+================================================================================
+platformio.ini — WRITE THIS EXACTLY
+================================================================================
+
+[env:clockspinner]
+platform = espressif32@3.2.0
+framework = arduino
+board = esp32dev
+board_build.f_cpu = 160000000L
+board_build.f_flash = 80000000L
+board_build.flash_mode = dout
+board_build.partitions = huge_app.csv
+upload_speed = 400000
+monitor_speed = 115200
+build_flags =
+    -DCORE_DEBUG_LEVEL=0
+    -Wno-unused-variable
+    -Wno-unused-function
+    -w
+
+
+================================================================================
+TROUBLESHOOTING GUIDE (write this as a comment block at the top of main.cpp)
+================================================================================
+
+Include this comment block at the top of main.cpp above all includes:
+
+  /*
+   * ClockSpinner — MKS DLC32 constant-speed stepper firmware
+   *
+   * Wi-Fi: Connect to "ClockSpinner" (password: clockwork)
+   * Web UI: http://192.168.4.1
+   * Serial monitor: 115200 baud
+   *
+   * HARDWARE NOTE: STEP/DIR/ENABLE signals are NOT on direct GPIO pins.
+   * They go through a 74HC595 shift register chain controlled by 3 GPIOs:
+   *   GPIO 16 = SR_BCK  (bit clock)
+   *   GPIO 17 = SR_WS   (latch)
+   *   GPIO 21 = SR_DATA (data)
+   * Bit assignments in the 32-bit shift word:
+   *   Bit 0 = ENABLE (all axes, active LOW)
+   *   Bit 1 = X STEP
+   *   Bit 2 = X DIR
+   *   Bit 5 = Y STEP
+   *   Bit 6 = Y DIR
+   *
+   * If motors don't move:
+   *   1. Check serial output — confirm "Web server started" message
+   *   2. Verify you can reach http://192.168.4.1
+   *   3. Try clicking Start in the web UI and watch Serial for any errors
+   *   4. Check that 24V (or 12V) power is connected to the motor power input
+   *   5. If motors buzz but don't move, try reversing direction in the UI
+   */
+
+
+================================================================================
+FINAL CHECKLIST — VERIFY BEFORE FINISHING
+================================================================================
+
+Before you finish, confirm:
+  [ ] platformio.ini exists in the root of this folder
+  [ ] src/main.cpp exists in the src/ subfolder
+  [ ] platformio.ini uses board = esp32dev and framework = arduino
+  [ ] platformio.ini uses platform = espressif32@3.2.0
+  [ ] platformio.ini uses board_build.partitions = huge_app.csv
+  [ ] src/main.cpp includes <Arduino.h>, <WiFi.h>, <WebServer.h>  — nothing else
+  [ ] shiftOut32() clocks 32 bits MSB-first on GPIO 16/17/21
+  [ ] ISR is marked IRAM_ATTR and calls shiftOut32() exactly TWICE (not 4×)
+  [ ] ISR uses portENTER_CRITICAL_ISR(&srMux) and directly sets srState bits
+  [ ] ISR does NOT call srWrite() (that function is main-thread only)
+  [ ] HTML is a complete self-contained page served as a PROGMEM string
+  [ ] The project compiles without errors (check for missing semicolons, types, etc.)
+  [ ] There are no references to any Grbl or external library headers
+
+================================================================================
+END OF PROMPT
+================================================================================
