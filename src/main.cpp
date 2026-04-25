@@ -1,10 +1,9 @@
 /*
- * ClockSpinner — MKS DLC32 stepper firmware with WLED-compatible network API
+ * Water Wheel Control — MKS DLC32 stepper firmware with WLED-compatible network API
  *
  * Direct access (AP):  Connect to "ClockSpinner" / "clockwork" → http://192.168.4.1
- * Network access (STA): Connect to your WiFi via the setup page, then the device
- *                        advertises itself via mDNS (_wled._tcp) and is discovered
- *                        automatically by the Nebula app.
+ * Network access (STA): Connect to your WiFi via Settings, then the device
+ *                        advertises itself via mDNS (_wled._tcp) for the Nebula app.
  * Serial: 115200 baud
  *
  * HARDWARE: STEP/DIR/ENABLE route through 74HC595 shift registers.
@@ -22,6 +21,7 @@
 #include <ESPmDNS.h>
 #include <SPIFFS.h>
 #include <WebServer.h>
+#include <Update.h>
 #include <ArduinoJson.h>
 
 // Shift register pins
@@ -41,6 +41,7 @@
 #define MIN_RPM        0.5f
 #define MAX_RPM        120.0f
 #define DEFAULT_RPM    30.0f
+#define SLIDER_MAX_RPM 70.0f
 
 // AP fallback (always available for direct access)
 #define AP_SSID  "ClockSpinner"
@@ -64,15 +65,15 @@ hw_timer_t*    stepTimer    = nullptr;
 bool    wledOn  = false;
 uint8_t wledBri = 128;
 
-// Config (persisted in /cfg.json on LittleFS)
-String deviceName = "MotorController";
+// Config (persisted in /cfg.json on SPIFFS)
+String deviceName = "WaterWheel";
 String wifiSSID   = "";
 String wifiPass   = "";
 
 // Runtime flags
 bool isSTAMode = false;
 
-// Web server (built-in synchronous WebServer — motor runs in ISR so blocking is fine)
+// Web server
 WebServer server(80);
 
 // =============================================================================
@@ -172,7 +173,7 @@ void setSpeed(float rpm) {
 }
 
 // =============================================================================
-// SECTION 7: CONFIG PERSISTENCE (LittleFS /cfg.json)
+// SECTION 7: CONFIG PERSISTENCE (SPIFFS /cfg.json)
 // =============================================================================
 
 void loadConfig() {
@@ -186,19 +187,26 @@ void loadConfig() {
     DeserializationError err = deserializeJson(doc, f);
     f.close();
     if (err) { Serial.printf("cfg.json parse error: %s\n", err.c_str()); return; }
-    deviceName = doc["id"]["name"] | "MotorController";
+    deviceName  = doc["id"]["name"] | "WaterWheel";
+    currentRpm  = doc["motor"]["rpm"] | DEFAULT_RPM;
+    dirForward  = doc["motor"]["dir"] | 1;
+    currentRpm  = constrain(currentRpm, MIN_RPM, MAX_RPM);
     if (doc["nw"]["ins"].size() > 0) {
         wifiSSID = doc["nw"]["ins"][0]["ssid"] | "";
         wifiPass = doc["nw"]["ins"][0]["psk"]  | "";
     }
-    Serial.printf("Config: name=%s ssid=%s\n", deviceName.c_str(), wifiSSID.c_str());
+    Serial.printf("Config: name=%s ssid=%s rpm=%.1f dir=%s\n",
+                  deviceName.c_str(), wifiSSID.c_str(),
+                  (float)currentRpm, dirForward ? "fwd" : "rev");
 }
 
 void saveConfig() {
     File f = SPIFFS.open("/cfg.json", "w");
     if (!f) { Serial.println("cfg.json write failed"); return; }
     DynamicJsonDocument doc(512);
-    doc["id"]["name"] = deviceName;
+    doc["id"]["name"]     = deviceName;
+    doc["motor"]["rpm"]   = (float)currentRpm;
+    doc["motor"]["dir"]   = dirForward ? 1 : 0;
     JsonObject ins0 = doc["nw"]["ins"].createNestedObject();
     ins0["ssid"] = wifiSSID;
     ins0["psk"]  = wifiPass;
@@ -211,8 +219,6 @@ void saveConfig() {
 // SECTION 8: WLED JSON BUILDERS
 // =============================================================================
 
-// Populates a JsonObject with the full WLED state.
-// `on` mirrors motorRunning; `bri` is stored but not yet mapped to motor speed.
 void populateState(JsonObject root) {
     root["on"]         = motorRunning;
     root["bri"]        = wledBri;
@@ -239,8 +245,6 @@ void populateState(JsonObject root) {
     s["si"]  = 0;   s["m12"] = 0;
 }
 
-// Populates a JsonObject with WLED device info. `brand:"WLED"` is required for
-// Nebula app discovery. Dynamic fields are populated from ESP32 runtime values.
 void populateInfo(JsonObject root) {
     String mac = WiFi.macAddress();
     mac.replace(":", ""); mac.toLowerCase();
@@ -248,7 +252,7 @@ void populateInfo(JsonObject root) {
     root["ver"]          = "0.15.0-b3";
     root["vid"]          = 2409250;
     root["name"]         = deviceName;
-    root["brand"]        = "WLED";        // ← required for Nebula app discovery
+    root["brand"]        = "WLED";
     root["product"]      = "FOSS";
     root["mac"]          = mac;
     root["ip"]           = isSTAMode ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
@@ -306,7 +310,7 @@ static void sendJson(int code, const String &body) {
 }
 
 // =============================================================================
-// SECTION 9: HTML PAGE
+// SECTION 9: HTML — MAIN CONTROL PAGE
 // =============================================================================
 
 const char INDEX_HTML[] PROGMEM = R"rawhtml(
@@ -315,181 +319,179 @@ const char INDEX_HTML[] PROGMEM = R"rawhtml(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ClockSpinner</title>
+<title>Water Wheel Control</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
-    background: #0d0d1a; color: #e0e0e0;
+    background: #080814; color: #e0e0e0;
     font-family: system-ui, -apple-system, sans-serif;
-    padding: 24px 16px 48px;
+    min-height: 100vh;
   }
-  .container { max-width: 480px; margin: 0 auto; }
-  h1 { font-size: 1.9rem; font-weight: 700; color: #7eb8f7; text-align: center;
-       letter-spacing: 0.04em; margin-bottom: 22px; }
-  .card { background: #141428; border: 1px solid #2a2a4a; border-radius: 14px;
-          padding: 18px 20px; margin-bottom: 14px; }
-  .card-title { font-size: 0.72rem; color: #555; text-transform: uppercase;
-                letter-spacing: 0.1em; margin-bottom: 12px; }
-  .info-row { display: flex; justify-content: space-between; align-items: center;
-              margin-bottom: 6px; font-size: 0.88rem; }
-  .info-key { color: #666; }
-  .info-val { color: #aaa; font-weight: 500; }
-  .info-val.good { color: #4cff88; }
-  .info-val.warn { color: #f7c97e; }
-  .badge { display: inline-block; padding: 4px 14px; border-radius: 20px;
-           font-size: 0.78rem; font-weight: 700; letter-spacing: 0.1em; }
-  .badge-running { background: #0d3320; color: #4cff88; border: 1px solid #1a6640; }
-  .badge-stopped { background: #330d0d; color: #ff4c4c; border: 1px solid #661a1a; }
-  .speed-big { font-size: 2.4rem; font-weight: 700; color: #7eb8f7;
-               text-align: center; margin: 8px 0 2px; }
-  .speed-unit { font-size: 0.85rem; color: #555; text-align: center; margin-bottom: 6px; }
-  .dir-line { font-size: 0.88rem; color: #777; text-align: center; }
-  .dir-arrow { color: #7eb8f7; }
-  .slider-row { display: flex; align-items: center; gap: 12px; margin: 10px 0 8px; }
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 20px 14px;
+    border-bottom: 1px solid #1a1a30;
+  }
+  .topbar-title {
+    font-size: 1.25rem; font-weight: 700; color: #7eb8f7;
+    letter-spacing: 0.03em;
+  }
+  .topbar-sub { font-size: 0.7rem; color: #444; margin-top: 2px; letter-spacing: 0.06em; text-transform: uppercase; }
+  .gear-link {
+    display: flex; align-items: center; justify-content: center;
+    width: 40px; height: 40px; border-radius: 10px;
+    background: #141428; border: 1px solid #2a2a4a;
+    color: #7eb8f7; font-size: 1.2rem; text-decoration: none;
+    transition: background 0.15s;
+  }
+  .gear-link:active { background: #1e1e3a; }
+
+  .main { padding: 20px 18px 48px; max-width: 440px; margin: 0 auto; }
+
+  /* Status hero */
+  .status-hero {
+    background: #0f0f20; border: 1px solid #1e1e38;
+    border-radius: 18px; padding: 24px 20px 20px;
+    text-align: center; margin-bottom: 14px;
+  }
+  .badge {
+    display: inline-block; padding: 5px 18px; border-radius: 20px;
+    font-size: 0.72rem; font-weight: 700; letter-spacing: 0.12em;
+    text-transform: uppercase; margin-bottom: 14px;
+  }
+  .badge-running { background: #0a2a18; color: #3dffa0; border: 1px solid #1a5535; }
+  .badge-stopped { background: #200a0a; color: #ff5555; border: 1px solid #551515; }
+  .rpm-big {
+    font-size: 4rem; font-weight: 800; color: #7eb8f7;
+    line-height: 1; letter-spacing: -0.02em;
+  }
+  .rpm-unit { font-size: 0.8rem; color: #444; letter-spacing: 0.12em; margin-top: 4px; margin-bottom: 4px; }
+  .dir-line { font-size: 0.82rem; color: #555; margin-top: 6px; }
+  .dir-arrow { color: #7eb8f7; font-size: 1rem; }
+
+  /* Cards */
+  .card {
+    background: #0f0f20; border: 1px solid #1e1e38;
+    border-radius: 14px; padding: 18px 18px; margin-bottom: 12px;
+  }
+  .card-label {
+    font-size: 0.68rem; color: #444; text-transform: uppercase;
+    letter-spacing: 0.12em; margin-bottom: 12px;
+  }
+
+  /* Slider */
+  .slider-row { display: flex; align-items: center; gap: 14px; }
   input[type=range] {
     flex: 1; -webkit-appearance: none; appearance: none;
-    height: 6px; border-radius: 3px; background: #2a2a4a; outline: none;
+    height: 6px; border-radius: 3px; background: #1e1e38; outline: none;
   }
   input[type=range]::-webkit-slider-thumb {
-    -webkit-appearance: none; width: 22px; height: 22px;
-    border-radius: 50%; background: #7eb8f7; cursor: pointer; border: 2px solid #0d0d1a;
+    -webkit-appearance: none; width: 24px; height: 24px;
+    border-radius: 50%; background: #7eb8f7; cursor: pointer;
+    border: 2px solid #080814; box-shadow: 0 0 8px #7eb8f740;
   }
   input[type=range]::-moz-range-thumb {
-    width: 22px; height: 22px; border-radius: 50%;
-    background: #7eb8f7; cursor: pointer; border: 2px solid #0d0d1a;
+    width: 24px; height: 24px; border-radius: 50%;
+    background: #7eb8f7; cursor: pointer; border: 2px solid #080814;
   }
-  .slider-val { min-width: 52px; text-align: right; font-size: 1rem;
-                color: #7eb8f7; font-weight: 600; }
-  .btn-grid { display: grid; gap: 10px; margin-top: 8px; }
-  .col2 { grid-template-columns: 1fr 1fr; }
-  .col1 { grid-template-columns: 1fr; }
-  button, input[type=submit] {
-    padding: 13px 10px; border: none; border-radius: 10px;
-    font-size: 0.88rem; font-weight: 600; cursor: pointer;
-    letter-spacing: 0.03em; transition: opacity 0.15s, transform 0.1s;
-    width: 100%;
+  .slider-val {
+    min-width: 52px; text-align: right;
+    font-size: 1.1rem; color: #7eb8f7; font-weight: 700;
   }
-  button:active, input[type=submit]:active { opacity: 0.75; transform: scale(0.97); }
-  .btn-accent { background: #7eb8f7; color: #0d0d1a; }
-  .btn-start  { background: #1a6640; color: #4cff88; border: 1px solid #2a9960; }
-  .btn-stop   { background: #661a1a; color: #ff6666; border: 1px solid #993030; }
-  .btn-dir    { background: #1e1e38; color: #7eb8f7; border: 1px solid #3a3a6a; }
-  .btn-save   { background: #1a3828; color: #7ef7a0; border: 1px solid #2a6040; }
-  .btn-reboot { background: #2a1a1a; color: #f7a07e; border: 1px solid #6a3010; }
-  label { display: block; font-size: 0.8rem; color: #888; margin-bottom: 5px; }
-  input[type=text], input[type=password] {
-    width: 100%; background: #0d0d1a; border: 1px solid #3a3a6a;
-    border-radius: 8px; color: #e0e0e0; font-size: 0.95rem;
-    padding: 10px 12px; outline: none; margin-bottom: 10px;
+  .set-btn {
+    width: 100%; margin-top: 12px; padding: 12px;
+    background: #1a2a3a; color: #7eb8f7; border: 1px solid #2a3a5a;
+    border-radius: 10px; font-size: 0.88rem; font-weight: 600;
+    cursor: pointer; letter-spacing: 0.04em;
+    transition: background 0.12s, transform 0.1s;
   }
-  input[type=text]:focus, input[type=password]:focus { border-color: #7eb8f7; }
-  .divider { border: none; border-top: 1px solid #1e1e38; margin: 12px 0; }
-  .status-line { margin-top: 14px; font-size: 0.7rem; color: #3a3a5a;
-                 text-align: center; min-height: 1.1em; word-break: break-all; }
+  .set-btn:active { background: #243550; transform: scale(0.97); }
+
+  /* Power button */
+  .power-btn {
+    width: 100%; padding: 20px 10px; border: none; border-radius: 14px;
+    font-size: 1.15rem; font-weight: 700; cursor: pointer;
+    letter-spacing: 0.06em; transition: opacity 0.15s, transform 0.1s;
+    margin-bottom: 12px;
+  }
+  .power-btn:active { opacity: 0.75; transform: scale(0.97); }
+  .power-start { background: #0d3320; color: #3dffa0; border: 1px solid #1a6640; }
+  .power-stop  { background: #330d0d; color: #ff6666; border: 1px solid #661a1a; }
+
+  /* Direction */
+  .dir-btn {
+    width: 100%; padding: 15px 10px; border-radius: 12px;
+    background: #131328; color: #7eb8f7; border: 1px solid #2a2a50;
+    font-size: 0.92rem; font-weight: 600; cursor: pointer;
+    letter-spacing: 0.04em; transition: background 0.12s, transform 0.1s;
+  }
+  .dir-btn:active { background: #1e1e3e; transform: scale(0.97); }
+
+  .status-line {
+    text-align: center; font-size: 0.68rem; color: #2a2a44;
+    margin-top: 18px; min-height: 1em; word-break: break-all;
+  }
 </style>
 </head>
 <body>
-<div class="container">
-  <h1>Clock Spinner</h1>
 
-  <!-- DEVICE INFO -->
-  <div class="card">
-    <div class="card-title">Device</div>
-    <div class="info-row">
-      <span class="info-key">Name</span>
-      <span class="info-val" id="devName">—</span>
-    </div>
-    <div class="info-row">
-      <span class="info-key">AP address</span>
-      <span class="info-val good">192.168.4.1</span>
-    </div>
-    <div class="info-row">
-      <span class="info-key">Network IP</span>
-      <span class="info-val" id="devIP">—</span>
-    </div>
-    <div class="info-row">
-      <span class="info-key">WiFi</span>
-      <span class="info-val" id="devWifi">—</span>
-    </div>
+<div class="topbar">
+  <div>
+    <div class="topbar-title">Water Wheel Control</div>
+    <div class="topbar-sub" id="topSub">Connecting...</div>
   </div>
+  <a href="/settings" class="gear-link" title="Settings">&#9881;</a>
+</div>
 
-  <!-- MOTOR STATUS -->
-  <div class="card">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-      <span class="card-title" style="margin-bottom:0">Motor</span>
-      <span class="badge badge-stopped" id="statusBadge">STOPPED</span>
-    </div>
-    <div class="speed-big" id="speedDisplay">30.0</div>
-    <div class="speed-unit">RPM</div>
+<div class="main">
+
+  <!-- STATUS HERO -->
+  <div class="status-hero">
+    <div><span class="badge badge-stopped" id="statusBadge">STOPPED</span></div>
+    <div class="rpm-big" id="speedDisplay">30.0</div>
+    <div class="rpm-unit">RPM</div>
     <div class="dir-line">
-      Direction: <span class="dir-arrow" id="dirArrow">&#8594;</span>
+      <span class="dir-arrow" id="dirArrow">&#8594;</span>
       <span id="dirLabel">Forward</span>
     </div>
   </div>
 
-  <!-- SPEED CONTROL -->
+  <!-- SPEED -->
   <div class="card">
-    <div class="card-title">Speed</div>
+    <div class="card-label">Speed</div>
     <div class="slider-row">
-      <input type="range" id="rpmSlider" min="0.5" max="120" step="0.5" value="30">
+      <input type="range" id="rpmSlider" min="0.5" max="70" step="0.5" value="30">
       <span class="slider-val" id="sliderVal">30.0</span>
     </div>
-    <div class="btn-grid col1">
-      <button class="btn-accent" onclick="sendSpeed()">Set Speed</button>
-    </div>
+    <button class="set-btn" onclick="sendSpeed()">Set Speed</button>
   </div>
 
-  <!-- CONTROL BUTTONS -->
-  <div class="card">
-    <div class="card-title">Control</div>
-    <div class="btn-grid col2">
-      <button class="btn-start" onclick="sendCmd('/start')">&#9654; Start</button>
-      <button class="btn-stop"  onclick="sendCmd('/stop')">&#9646;&#9646; Stop</button>
-    </div>
-    <div class="btn-grid col1" style="margin-top:10px">
-      <button class="btn-dir" onclick="sendCmd('/direction')">&#8646; Reverse Direction</button>
-    </div>
-  </div>
+  <!-- POWER + DIRECTION -->
+  <button id="powerBtn" class="power-btn power-start" onclick="togglePower()">
+    &#9654;&nbsp; Start
+  </button>
+  <button class="dir-btn" onclick="sendCmd('/direction')">
+    &#8646;&nbsp; Reverse Direction
+  </button>
 
-  <!-- WIFI SETTINGS -->
-  <div class="card">
-    <div class="card-title">WiFi Network</div>
-    <form method="POST" action="/settings/wifi">
-      <label for="ssid">Network SSID</label>
-      <input type="text" id="ssid" name="ssid" placeholder="Your WiFi name" autocomplete="off">
-      <label for="psk">Password</label>
-      <input type="password" id="psk" name="psk" placeholder="WiFi password" autocomplete="off">
-      <input type="submit" class="btn-save" value="&#10003; Save WiFi &amp; Reboot">
-    </form>
-  </div>
+  <div class="status-line" id="statusLine">&nbsp;</div>
 
-  <!-- DEVICE NAME -->
-  <div class="card">
-    <div class="card-title">Device Name</div>
-    <label for="nameInput">Shown in Nebula app</label>
-    <input type="text" id="nameInput" placeholder="MotorController" autocomplete="off">
-    <button class="btn-save" onclick="saveName()">&#10003; Save Name</button>
-  </div>
-
-  <!-- REBOOT -->
-  <div class="card">
-    <button class="btn-reboot" onclick="if(confirm('Reboot device?')) sendCmd('/reset')">
-      &#8635; Reboot Device
-    </button>
-  </div>
-
-  <div class="status-line" id="statusLine">Connecting…</div>
 </div>
 
 <script>
+  let isRunning = false;
+
   const slider = document.getElementById('rpmSlider');
   slider.addEventListener('input', () => {
     document.getElementById('sliderVal').textContent = parseFloat(slider.value).toFixed(1);
   });
 
-  function setStatus(msg) { document.getElementById('statusLine').textContent = msg; }
+  function setStatus(msg) {
+    document.getElementById('statusLine').textContent = msg;
+  }
 
   function updateMotorUI(data) {
+    isRunning = data.running;
     if (document.activeElement !== slider) {
       slider.value = data.rpm;
       document.getElementById('sliderVal').textContent = parseFloat(data.rpm).toFixed(1);
@@ -501,39 +503,33 @@ const char INDEX_HTML[] PROGMEM = R"rawhtml(
     const fwd = data.dir === 'fwd';
     document.getElementById('dirArrow').innerHTML = fwd ? '&#8594;' : '&#8592;';
     document.getElementById('dirLabel').textContent = fwd ? 'Forward' : 'Reverse';
+    const btn = document.getElementById('powerBtn');
+    if (data.running) {
+      btn.innerHTML = '&#9646;&#9646;&nbsp; Stop';
+      btn.className = 'power-btn power-stop';
+    } else {
+      btn.innerHTML = '&#9654;&nbsp; Start';
+      btn.className = 'power-btn power-start';
+    }
+    document.getElementById('topSub').textContent = data.running
+      ? parseFloat(data.rpm).toFixed(1) + ' RPM — Running'
+      : 'Stopped';
   }
 
-  function updateDeviceUI(info) {
-    document.getElementById('devName').textContent = info.name || '—';
-    document.getElementById('devIP').textContent   = info.ip || '—';
-    const wf = info.wifi;
-    if (wf && !wf.ap && wf.bssid) {
-      document.getElementById('devWifi').textContent = '&#10003; ' + (wf.bssid || 'connected');
-      document.getElementById('devWifi').classList.add('good');
-    } else {
-      document.getElementById('devWifi').textContent = 'AP only (not joined)';
-      document.getElementById('devWifi').classList.add('warn');
-    }
-    const ni = document.getElementById('nameInput');
-    if (document.activeElement !== ni) ni.value = info.name || '';
+  function togglePower() {
+    sendCmd(isRunning ? '/stop' : '/start');
   }
 
   function fetchStatus() {
     fetch('/status')
       .then(r => r.json()).then(updateMotorUI)
-      .catch(e => setStatus('Motor status error: ' + e));
-  }
-
-  function fetchInfo() {
-    fetch('/json/info')
-      .then(r => r.json()).then(updateDeviceUI)
       .catch(() => {});
   }
 
   function sendCmd(path) {
     fetch(path, { method: 'POST' })
       .then(r => r.json())
-      .then(d => { setStatus(path + ' \u2192 ' + JSON.stringify(d)); fetchStatus(); })
+      .then(() => fetchStatus())
       .catch(e => setStatus('Error: ' + e));
   }
 
@@ -543,8 +539,230 @@ const char INDEX_HTML[] PROGMEM = R"rawhtml(
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: 'rpm=' + slider.value
     }).then(r => r.json())
-      .then(d => { setStatus('/speed \u2192 ' + JSON.stringify(d)); fetchStatus(); })
+      .then(() => { setStatus('Speed set to ' + slider.value + ' RPM'); fetchStatus(); })
       .catch(e => setStatus('Error: ' + e));
+  }
+
+  fetchStatus();
+  setInterval(fetchStatus, 3000);
+</script>
+</body>
+</html>
+)rawhtml";
+
+// =============================================================================
+// SECTION 10: HTML — SETTINGS PAGE
+// =============================================================================
+
+const char SETTINGS_HTML[] PROGMEM = R"rawhtml(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Settings — Water Wheel</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #080814; color: #e0e0e0;
+    font-family: system-ui, -apple-system, sans-serif;
+    min-height: 100vh;
+  }
+  .topbar {
+    display: flex; align-items: center; gap: 14px;
+    padding: 18px 20px 14px;
+    border-bottom: 1px solid #1a1a30;
+  }
+  .back-link {
+    display: flex; align-items: center; justify-content: center;
+    width: 38px; height: 38px; border-radius: 10px;
+    background: #141428; border: 1px solid #2a2a4a;
+    color: #7eb8f7; font-size: 1.1rem; text-decoration: none;
+    flex-shrink: 0; transition: background 0.12s;
+  }
+  .back-link:active { background: #1e1e3a; }
+  .topbar-title { font-size: 1.2rem; font-weight: 700; color: #e0e0e0; }
+
+  .main { padding: 18px 18px 60px; max-width: 440px; margin: 0 auto; }
+
+  .card {
+    background: #0f0f20; border: 1px solid #1e1e38;
+    border-radius: 14px; padding: 18px; margin-bottom: 12px;
+  }
+  .card-title {
+    font-size: 0.68rem; color: #7eb8f7; text-transform: uppercase;
+    letter-spacing: 0.12em; margin-bottom: 14px; font-weight: 600;
+  }
+  .info-row {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 8px; font-size: 0.87rem;
+  }
+  .info-key { color: #555; }
+  .info-val { color: #999; font-weight: 500; }
+  .info-val.good { color: #3dffa0; }
+  .info-val.warn { color: #f7c97e; }
+
+  label { display: block; font-size: 0.78rem; color: #666; margin-bottom: 5px; }
+  input[type=text], input[type=password] {
+    width: 100%; background: #080814; border: 1px solid #2a2a4a;
+    border-radius: 8px; color: #e0e0e0; font-size: 0.95rem;
+    padding: 11px 13px; outline: none; margin-bottom: 12px;
+  }
+  input[type=text]:focus, input[type=password]:focus { border-color: #7eb8f7; }
+  input[type=file] {
+    width: 100%; background: #080814; border: 1px solid #2a2a4a;
+    border-radius: 8px; color: #999; font-size: 0.85rem;
+    padding: 10px 12px; margin-bottom: 12px; cursor: pointer;
+  }
+
+  .btn {
+    width: 100%; padding: 13px 10px; border: none; border-radius: 10px;
+    font-size: 0.88rem; font-weight: 600; cursor: pointer;
+    letter-spacing: 0.04em; transition: opacity 0.15s, transform 0.1s;
+  }
+  .btn:active { opacity: 0.78; transform: scale(0.97); }
+  .btn-save   { background: #0d2d1e; color: #3dffa0; border: 1px solid #1a5535; }
+  .btn-accent { background: #1a2a3a; color: #7eb8f7; border: 1px solid #2a3a5a; }
+  .btn-reboot { background: #1e1010; color: #f7907e; border: 1px solid #4a2010; }
+  .btn-update { background: #1a1a2a; color: #c0a8ff; border: 1px solid #3a2a6a; }
+
+  .divider { border: none; border-top: 1px solid #1a1a2e; margin: 12px 0; }
+
+  .ota-progress {
+    display: none; background: #1a1a2a; border-radius: 8px;
+    overflow: hidden; height: 8px; margin-bottom: 10px;
+  }
+  .ota-bar {
+    height: 100%; background: #7eb8f7; width: 0%;
+    transition: width 0.2s; border-radius: 8px;
+  }
+  .ota-status {
+    font-size: 0.78rem; color: #666; text-align: center;
+    min-height: 1.1em; margin-bottom: 10px;
+  }
+  .status-line {
+    font-size: 0.72rem; color: #2a2a44; text-align: center;
+    margin-top: 16px; min-height: 1em;
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <a href="/" class="back-link" title="Back">&#8592;</a>
+  <div class="topbar-title">Settings</div>
+</div>
+
+<div class="main">
+
+  <!-- DEVICE INFO -->
+  <div class="card">
+    <div class="card-title">Device Info</div>
+    <div class="info-row">
+      <span class="info-key">Name</span>
+      <span class="info-val" id="devName">—</span>
+    </div>
+    <div class="info-row">
+      <span class="info-key">AP (direct)</span>
+      <span class="info-val good">192.168.4.1</span>
+    </div>
+    <div class="info-row">
+      <span class="info-key">Network IP</span>
+      <span class="info-val" id="devIP">—</span>
+    </div>
+    <div class="info-row">
+      <span class="info-key">WiFi</span>
+      <span class="info-val" id="devWifi">—</span>
+    </div>
+    <div class="info-row">
+      <span class="info-key">Free heap</span>
+      <span class="info-val" id="devHeap">—</span>
+    </div>
+    <div class="info-row">
+      <span class="info-key">Uptime</span>
+      <span class="info-val" id="devUptime">—</span>
+    </div>
+  </div>
+
+  <!-- WIFI -->
+  <div class="card">
+    <div class="card-title">WiFi Network</div>
+    <form id="wifiForm">
+      <label for="ssid">Network SSID</label>
+      <input type="text" id="ssid" name="ssid" placeholder="WiFi network name" autocomplete="off">
+      <label for="psk">Password</label>
+      <input type="password" id="psk" name="psk" placeholder="WiFi password" autocomplete="off">
+      <button type="button" class="btn btn-save" onclick="saveWifi()">
+        &#10003; Save &amp; Reboot
+      </button>
+    </form>
+  </div>
+
+  <!-- DEVICE NAME -->
+  <div class="card">
+    <div class="card-title">Device Name</div>
+    <label for="nameInput">Shown in Nebula app</label>
+    <input type="text" id="nameInput" placeholder="WaterWheel" autocomplete="off">
+    <button class="btn btn-save" onclick="saveName()">&#10003; Save Name</button>
+  </div>
+
+  <!-- FIRMWARE UPDATE -->
+  <div class="card">
+    <div class="card-title">Firmware Update (OTA)</div>
+    <label for="fwFile">Select .bin file</label>
+    <input type="file" id="fwFile" accept=".bin">
+    <div class="ota-status" id="otaStatus">Choose a firmware .bin file to upload</div>
+    <div class="ota-progress" id="otaProgressWrap">
+      <div class="ota-bar" id="otaBar"></div>
+    </div>
+    <button class="btn btn-update" onclick="startOTA()">&#8593; Upload Firmware</button>
+  </div>
+
+  <!-- REBOOT -->
+  <div class="card">
+    <button class="btn btn-reboot" onclick="doReboot()">
+      &#8635; Reboot Device
+    </button>
+  </div>
+
+  <div class="status-line" id="statusLine">&nbsp;</div>
+
+</div>
+
+<script>
+  function setStatus(msg) { document.getElementById('statusLine').textContent = msg; }
+
+  function updateDeviceUI(info) {
+    document.getElementById('devName').textContent = info.name || '—';
+    document.getElementById('devIP').textContent   = info.ip  || '—';
+    document.getElementById('devHeap').textContent =
+      info.freeheap ? Math.round(info.freeheap / 1024) + ' KB' : '—';
+    document.getElementById('devUptime').textContent =
+      info.uptime ? Math.floor(info.uptime / 60) + 'm ' + (info.uptime % 60) + 's' : '—';
+    const wf = info.wifi;
+    const wifiEl = document.getElementById('devWifi');
+    if (wf && !wf.ap && wf.bssid) {
+      wifiEl.textContent = '\u2713 Connected (' + wf.signal + '%)';
+      wifiEl.className = 'info-val good';
+    } else {
+      wifiEl.textContent = 'AP only';
+      wifiEl.className = 'info-val warn';
+    }
+    const ni = document.getElementById('nameInput');
+    if (document.activeElement !== ni) ni.value = info.name || '';
+  }
+
+  function saveWifi() {
+    const ssid = document.getElementById('ssid').value.trim();
+    const psk  = document.getElementById('psk').value;
+    if (!ssid) { setStatus('Enter an SSID first'); return; }
+    const body = 'ssid=' + encodeURIComponent(ssid) + '&psk=' + encodeURIComponent(psk);
+    fetch('/settings/wifi', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body
+    }).catch(() => {});
+    setStatus('Saved — device is rebooting...');
   }
 
   function saveName() {
@@ -559,22 +777,76 @@ const char INDEX_HTML[] PROGMEM = R"rawhtml(
       .catch(e => setStatus('Error: ' + e));
   }
 
-  fetchStatus();
+  function doReboot() {
+    if (!confirm('Reboot the device?')) return;
+    fetch('/reset', { method: 'POST' }).catch(() => {});
+    setStatus('Rebooting...');
+  }
+
+  function startOTA() {
+    const file = document.getElementById('fwFile').files[0];
+    if (!file) { setStatus('Please select a .bin file first'); return; }
+    if (!file.name.endsWith('.bin')) { setStatus('File must be a .bin firmware image'); return; }
+
+    const formData = new FormData();
+    formData.append('firmware', file);
+
+    const bar   = document.getElementById('otaBar');
+    const wrap  = document.getElementById('otaProgressWrap');
+    const status = document.getElementById('otaStatus');
+
+    wrap.style.display = 'block';
+    bar.style.width = '0%';
+    status.textContent = 'Uploading...';
+    document.querySelector('.btn-update').disabled = true;
+
+    const xhr = new XMLHttpRequest();
+    xhr.upload.addEventListener('progress', e => {
+      if (e.lengthComputable) {
+        const pct = Math.round(e.loaded / e.total * 100);
+        bar.style.width = pct + '%';
+        status.textContent = 'Uploading... ' + pct + '%';
+      }
+    });
+    xhr.addEventListener('load', () => {
+      bar.style.width = '100%';
+      if (xhr.status === 200 && !xhr.responseText.includes('FAIL')) {
+        status.textContent = '\u2713 ' + xhr.responseText;
+        setStatus('Update complete — device is rebooting');
+      } else {
+        status.textContent = 'Update failed: ' + xhr.responseText;
+        setStatus('OTA update failed');
+        document.querySelector('.btn-update').disabled = false;
+      }
+    });
+    xhr.addEventListener('error', () => {
+      status.textContent = 'Upload error — check connection';
+      document.querySelector('.btn-update').disabled = false;
+    });
+    xhr.open('POST', '/update');
+    xhr.send(formData);
+  }
+
+  function fetchInfo() {
+    fetch('/json/info')
+      .then(r => r.json()).then(updateDeviceUI)
+      .catch(() => {});
+  }
+
   fetchInfo();
-  setInterval(fetchStatus, 3000);
-  setInterval(fetchInfo, 10000);
+  setInterval(fetchInfo, 8000);
 </script>
 </body>
 </html>
 )rawhtml";
 
 // =============================================================================
-// SECTION 10: WEB SERVER ROUTES
+// SECTION 11: WEB SERVER ROUTES
 // =============================================================================
 
 void setupRoutes() {
 
-    // OPTIONS catch-all — CORS preflight for all paths
+    // OPTIONS catch-all — CORS preflight
     server.onNotFound([]() {
         if (server.method() == HTTP_OPTIONS) {
             addCORS();
@@ -584,28 +856,31 @@ void setupRoutes() {
         }
     });
 
-    // Root — config + motor control page
+    // GET / — main control page
     server.on("/", HTTP_GET, []() {
         server.send_P(200, "text/html", INDEX_HTML);
     });
 
+    // GET /settings — settings page
+    server.on("/settings", HTTP_GET, []() {
+        server.send_P(200, "text/html", SETTINGS_HTML);
+    });
+
     // ---- Config endpoints ----------------------------------------
 
-    // POST /settings/wifi — save credentials and reboot
     server.on("/settings/wifi", HTTP_POST, []() {
         if (server.hasArg("ssid")) wifiSSID = server.arg("ssid");
         if (server.hasArg("psk"))  wifiPass = server.arg("psk");
         saveConfig();
         server.send(200, "text/html",
-            "<html><body style='background:#0d0d1a;color:#e0e0e0;"
+            "<html><body style='background:#080814;color:#e0e0e0;"
             "font-family:sans-serif;text-align:center;padding:3rem'>"
-            "<h2 style='color:#7eb8f7'>&#10003; Saved!</h2>"
-            "<p>Rebooting now&hellip;</p></body></html>");
+            "<h2 style='color:#3dffa0'>&#10003; Saved!</h2>"
+            "<p style='color:#666;margin-top:8px'>Rebooting now&hellip;</p></body></html>");
         delay(500);
         ESP.restart();
     });
 
-    // POST /settings/ui — save device name (no reboot needed)
     server.on("/settings/ui", HTTP_POST, []() {
         if (server.hasArg("name")) {
             deviceName = server.arg("name");
@@ -614,12 +889,42 @@ void setupRoutes() {
         sendJson(200, "{\"ok\":true}");
     });
 
-    // POST /reset — reboot
     server.on("/reset", HTTP_POST, []() {
         server.send(200, "text/plain", "Rebooting...");
         delay(500);
         ESP.restart();
     });
+
+    // ---- OTA firmware update via HTTP upload --------------------
+
+    server.on("/update", HTTP_POST,
+        []() {
+            server.sendHeader("Connection", "close");
+            bool ok = !Update.hasError();
+            server.send(200, "text/plain", ok ? "Update OK! Rebooting..." : "Update FAILED!");
+            delay(1000);
+            ESP.restart();
+        },
+        []() {
+            HTTPUpload &upload = server.upload();
+            if (upload.status == UPLOAD_FILE_START) {
+                Serial.printf("OTA start: %s\n", upload.filename.c_str());
+                if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+                    Update.printError(Serial);
+                }
+            } else if (upload.status == UPLOAD_FILE_WRITE) {
+                if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+                    Update.printError(Serial);
+                }
+            } else if (upload.status == UPLOAD_FILE_END) {
+                if (Update.end(true)) {
+                    Serial.printf("OTA success: %u bytes\n", upload.totalSize);
+                } else {
+                    Update.printError(Serial);
+                }
+            }
+        }
+    );
 
     // ---- Motor control endpoints ---------------------------------
 
@@ -642,17 +947,18 @@ void setupRoutes() {
     server.on("/direction", HTTP_POST, []() {
         dirForward = !dirForward;
         if (motorRunning) applyDirection();
+        saveConfig();
         sendJson(200, String("{\"ok\":true,\"dir\":\"") + (dirForward ? "fwd" : "rev") + "\"}");
     });
 
     server.on("/speed", HTTP_POST, []() {
         if (server.hasArg("rpm")) setSpeed(server.arg("rpm").toFloat());
+        saveConfig();
         sendJson(200, "{\"ok\":true,\"rpm\":" + String(currentRpm, 1) + "}");
     });
 
     // ---- WLED JSON API -------------------------------------------
 
-    // GET /json/info
     server.on("/json/info", HTTP_GET, []() {
         DynamicJsonDocument doc(2560);
         populateInfo(doc.to<JsonObject>());
@@ -660,7 +966,6 @@ void setupRoutes() {
         sendJson(200, out);
     });
 
-    // GET /json/state
     server.on("/json/state", HTTP_GET, []() {
         DynamicJsonDocument doc(1536);
         populateState(doc.to<JsonObject>());
@@ -668,8 +973,6 @@ void setupRoutes() {
         sendJson(200, out);
     });
 
-    // POST /json/state — raw JSON body via server.arg("plain")
-    // `on` maps to motor start/stop; `bri` stored but not yet mapped
     server.on("/json/state", HTTP_POST, []() {
         String body = server.arg("plain");
         DynamicJsonDocument bodyDoc(256);
@@ -687,7 +990,6 @@ void setupRoutes() {
         sendJson(200, out);
     });
 
-    // GET /json — combined state + info + effects + palettes
     server.on("/json", HTTP_GET, []() {
         DynamicJsonDocument doc(5120);
         JsonObject root = doc.to<JsonObject>();
@@ -699,12 +1001,9 @@ void setupRoutes() {
         sendJson(200, out);
     });
 
-    // GET /json/effects
     server.on("/json/effects",  HTTP_GET, []() { sendJson(200, "[\"Solid\"]");   });
-    // GET /json/palettes
     server.on("/json/palettes", HTTP_GET, []() { sendJson(200, "[\"Default\"]"); });
 
-    // GET /win — WLED legacy XML API
     server.on("/win", HTTP_GET, []() {
         String name = deviceName;
         name.replace("&", "&amp;"); name.replace("<", "&lt;"); name.replace(">", "&gt;");
@@ -727,18 +1026,16 @@ void setupRoutes() {
 }
 
 // =============================================================================
-// SECTION 11: WIFI + mDNS SETUP
+// SECTION 12: WIFI + mDNS SETUP
 // =============================================================================
 
 void setupWifi() {
-    // Always run the AP so the device is directly accessible even without network
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(AP_SSID, AP_PASS);
     Serial.printf("AP ready: %s — http://%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 
     if (wifiSSID.length() == 0) {
-        Serial.println("No WiFi credentials stored — AP only mode");
-        Serial.println("Connect to ClockSpinner and open http://192.168.4.1 to configure");
+        Serial.println("No WiFi credentials — AP only mode");
         return;
     }
 
@@ -759,19 +1056,17 @@ void setupWifi() {
     isSTAMode = true;
     Serial.printf("\nConnected! STA IP: %s\n", WiFi.localIP().toString().c_str());
 
-    // mDNS — hostname wled-XXXXXX (last 6 chars of MAC, lowercase).
-    // Nebula app discovers devices by scanning for _wled._tcp on the network.
     String mac = WiFi.macAddress();
     mac.replace(":", ""); mac.toLowerCase();
     String mdnsName = "wled-" + mac.substring(6);
 
     if (MDNS.begin(mdnsName.c_str())) {
         MDNS.addService("http", "tcp", 80);
-        MDNS.addService("wled", "tcp", 80);                          // ← discovery hook
+        MDNS.addService("wled", "tcp", 80);
         MDNS.addServiceTxt("wled", "tcp", "mac", mac.c_str());
         MDNS.addServiceTxt("wled", "tcp", "ver", "0.15.0-b3");
         MDNS.addServiceTxt("wled", "tcp", "ip",  WiFi.localIP().toString().c_str());
-        Serial.printf("mDNS: http://%s.local  (will appear in Nebula as '%s')\n",
+        Serial.printf("mDNS: http://%s.local  (Nebula name: '%s')\n",
                       mdnsName.c_str(), deviceName.c_str());
     } else {
         Serial.println("mDNS start failed");
@@ -779,36 +1074,30 @@ void setupWifi() {
 }
 
 // =============================================================================
-// SECTION 12: setup()
+// SECTION 13: setup()
 // =============================================================================
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("\nClockSpinner booting...");
+    Serial.println("\nWater Wheel booting...");
 
-    // Init shift register GPIO pins
     pinMode(SR_BCK,  OUTPUT); pinMode(SR_WS,   OUTPUT); pinMode(SR_DATA, OUTPUT);
     digitalWrite(SR_BCK, LOW); digitalWrite(SR_WS, LOW); digitalWrite(SR_DATA, LOW);
     srState = 0;
     shiftOut32();
-    srWrite(BIT_ENABLE, true);   // ENABLE HIGH = motors disabled at boot
+    srWrite(BIT_ENABLE, true);
     Serial.printf("SR init: srState=0x%X\n", srState);
 
-    // Mount LittleFS (format on first boot if needed)
     if (!SPIFFS.begin(true)) {
-        Serial.println("LittleFS mount/format failed");
+        Serial.println("SPIFFS mount failed");
     } else {
-        Serial.println("LittleFS mounted");
+        Serial.println("SPIFFS mounted");
         loadConfig();
     }
 
-    // WiFi (STA if credentials saved, always AP)
     setupWifi();
-
-    // HTTP routes
     setupRoutes();
 
-    // Auto-start motor
     Serial.println("Auto-start: spinning up...");
     startMotor();
 
@@ -816,7 +1105,7 @@ void setup() {
 }
 
 // =============================================================================
-// SECTION 13: loop()
+// SECTION 14: loop()
 // =============================================================================
 
 void loop() {
